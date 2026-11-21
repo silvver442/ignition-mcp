@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-BINDING_TYPES = ("property", "expression", "tag", "query", "expr-struct", "http", "tag-history")
+BINDING_TYPES = ("property", "expression", "expr", "tag", "query", "expr-struct", "http", "tag-history")
 
 
 def validate_view(view: object) -> list[str]:
