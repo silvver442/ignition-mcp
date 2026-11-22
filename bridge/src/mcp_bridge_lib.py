@@ -14,6 +14,8 @@ import hashlib
 import hmac
 import os
 import codecs
+import errno
+import stat
 
 BRIDGE_VERSION = '0.1.0'
 
@@ -378,8 +380,16 @@ def handle_files_read(payload):
     if not rel:
         return _err('path is required')
     full = _safe_path(rel)
-    if not os.path.isfile(full):
-        return _err('file not found: %s' % rel)
+    try:
+        mode = os.stat(full).st_mode
+    except OSError as e:
+        if e.errno == errno.ENOENT:
+            result = _err('file not found: %s' % rel)
+            result['code'] = 'not_found'
+            return result
+        return _err('read failed: %s' % str(e))
+    if not stat.S_ISREG(mode):
+        return _err('not a regular file: %s' % rel)
     try:
         with codecs.open(full, 'r', 'utf-8') as f:
             content = f.read()
@@ -490,6 +500,9 @@ def handle(request):
         return {'json': {'ok': False, 'error': str(e)}}
 
     if _is_err(result):
-        return {'json': {'ok': False, 'error': result['error'],
-                         'remediation': result.get('remediation', '')}}
+        error = {'ok': False, 'error': result['error'],
+                 'remediation': result.get('remediation', '')}
+        if 'code' in result:
+            error['code'] = result['code']
+        return {'json': error}
     return {'json': {'ok': True, 'data': result}}

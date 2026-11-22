@@ -7,7 +7,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from ..app import AppContext, tool_result
-from ..errors import GatewayError, ValidationError
+from ..errors import GatewayError, NotFoundError, ValidationError
 from ..guards import require_name_echo, require_writes
 from ..perspective.schema import validate_view
 
@@ -17,6 +17,23 @@ PERSPECTIVE = "com.inductiveautomation.perspective"
 def _view_dir(project: str, view_path: str) -> str:
     """Relative path (under data/projects/) of a view folder."""
     return f"{project}/{PERSPECTIVE}/views/{view_path}"
+
+
+def _read_project_file(ctx: AppContext, path: str) -> str:
+    result = ctx.bridge.call("files/read", {"path": path})
+    if not isinstance(result, dict) or not isinstance(result.get("content"), str):
+        raise GatewayError(f"Invalid bridge response when reading {path}")
+    return result["content"]
+
+
+def _read_project_json(ctx: AppContext, path: str) -> dict[str, Any]:
+    try:
+        value = json.loads(_read_project_file(ctx, path))
+    except json.JSONDecodeError as exc:
+        raise GatewayError(f"Invalid JSON in {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise GatewayError(f"Expected a JSON object in {path}")
+    return value
 
 
 def register(mcp: FastMCP, ctx: AppContext) -> None:
@@ -47,11 +64,7 @@ def register(mcp: FastMCP, ctx: AppContext) -> None:
         """Read-only, bridge plane."""
         if not project or not view_path:
             raise ValidationError("both project and view_path must be non-empty")
-        raw = ctx.bridge.call("files/read", {"path": _view_dir(project, view_path) + "/view.json"})
-        try:
-            view = json.loads(raw["content"])
-        except json.JSONDecodeError as exc:
-            raise GatewayError(f"view.json is not valid JSON: {exc}") from exc
+        view = _read_project_json(ctx, _view_dir(project, view_path) + "/view.json")
         return {"project": project, "view_path": view_path, "view": view}
 
     @mcp.tool()
@@ -68,30 +81,43 @@ def register(mcp: FastMCP, ctx: AppContext) -> None:
         problems = validate_view(view_json)
         if problems:
             raise ValidationError(f"view_json failed validation: {'; '.join(problems)}")
+        view_dir = _view_dir(project, view_path)
+        view_file = view_dir + "/view.json"
+        manifest_file = view_dir + "/resource.json"
+        create_manifest = False
+        try:
+            _read_project_file(ctx, manifest_file)
+        except NotFoundError:
+            try:
+                _read_project_file(ctx, view_file)
+            except NotFoundError:
+                create_manifest = True
+            else:
+                raise GatewayError(
+                    f"Existing view is missing its manifest: {manifest_file}"
+                ) from None
+
         ctx.bridge.call(
-            "files/write",
-            {
-                "path": _view_dir(project, view_path) + "/view.json",
-                "content": json.dumps(view_json, indent=2),
-            },
+            "files/write", {"path": view_file, "content": json.dumps(view_json, indent=2)}
         )
-        ctx.bridge.call(
-            "files/write",
-            {
-                "path": _view_dir(project, view_path) + "/resource.json",
-                "content": json.dumps(
-                    {
-                        "scope": "G",
-                        "version": 1,
-                        "restricted": False,
-                        "overridable": True,
-                        "files": ["view.json"],
-                        "attributes": {},
-                    },
-                    indent=2,
-                ),
-            },
-        )
+        if create_manifest:
+            ctx.bridge.call(
+                "files/write",
+                {
+                    "path": manifest_file,
+                    "content": json.dumps(
+                        {
+                            "scope": "G",
+                            "version": 1,
+                            "restricted": False,
+                            "overridable": True,
+                            "files": ["view.json"],
+                            "attributes": {},
+                        },
+                        indent=2,
+                    ),
+                },
+            )
         scan = ctx.client.scan_projects()
         return {"project": project, "view_path": view_path, "deployed": True, "scan": scan}
 
@@ -120,13 +146,8 @@ def register_extra(mcp: FastMCP, ctx: AppContext) -> None:
     @tool_result(ctx)
     def perspective_page_config_get(project: str) -> dict[str, Any]:
         """Read-only, bridge plane."""
-        try:
-            raw = ctx.bridge.call(
-                "files/read", {"path": f"{project}/{PERSPECTIVE}/page-config/config.json"}
-            )
-            return {"project": project, "pages": json.loads(raw["content"])}
-        except GatewayError:
-            return {"project": project, "pages": {}}
+        path = f"{project}/{PERSPECTIVE}/page-config/config.json"
+        return {"project": project, "pages": _read_project_json(ctx, path)}
 
     @mcp.tool()
     @tool_result(ctx)
@@ -137,18 +158,19 @@ def register_extra(mcp: FastMCP, ctx: AppContext) -> None:
         require_writes(ctx.settings, confirm, "perspective_page_config_set")
         if not page_url.startswith("/"):
             raise ValidationError("page_url must start with /")
-        try:
-            raw = ctx.bridge.call(
-                "files/read", {"path": f"{project}/{PERSPECTIVE}/page-config/config.json"}
-            )
-            config = json.loads(raw["content"])
-        except (GatewayError, ValueError):
-            config = {"pages": {}}
-        config["pages"][page_url] = {"viewPath": view_path, "title": title or view_path}
+        path = f"{project}/{PERSPECTIVE}/page-config/config.json"
+        config = _read_project_json(ctx, path)
+        pages = config.get("pages")
+        if not isinstance(pages, dict):
+            raise GatewayError(f"Expected a pages object in {path}")
+        page = pages.get(page_url, {})
+        if not isinstance(page, dict):
+            raise GatewayError(f"Expected an object for page {page_url} in {path}")
+        pages[page_url] = {**page, "viewPath": view_path, "title": title or view_path}
         ctx.bridge.call(
             "files/write",
             {
-                "path": f"{project}/{PERSPECTIVE}/page-config/config.json",
+                "path": path,
                 "content": json.dumps(config, indent=2),
             },
         )

@@ -21,7 +21,7 @@ from typing import Any
 import httpx
 
 from .config import Settings
-from .errors import BridgeUnavailableError, GatewayError
+from .errors import BridgeUnavailableError, GatewayError, NotFoundError
 
 BRIDGE_BASE = "/system/webdev/mcp-bridge/api"
 MIN_BRIDGE_VERSION = "0.1.0"
@@ -72,9 +72,14 @@ class BridgeClient:
         if resp.status_code >= 400:
             raise GatewayError(f"Bridge error {resp.status_code} on {endpoint}: {resp.text[:300]}")
 
-        data = resp.json() if resp.content else {}
+        try:
+            data = resp.json() if resp.content else {}
+        except ValueError as exc:
+            raise GatewayError(f"Bridge endpoint {endpoint} returned invalid JSON") from exc
         if isinstance(data, dict) and data.get("ok") is False:
             error = str(data.get("error", "unknown error"))
+            if endpoint == "files/read" and data.get("code") == "not_found":
+                raise NotFoundError(error)
             if data.get("code") == "auth":
                 if "not configured" in error:
                     raise BridgeUnavailableError(
