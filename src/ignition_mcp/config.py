@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import re
 from dataclasses import dataclass, field
+
+PROJECT_NAME = re.compile(r"[A-Za-z0-9_]+")
 
 
 @dataclass(frozen=True)
@@ -16,6 +19,11 @@ class Settings:
     tls_verify: bool = True
     timeout_s: float = 30.0
     tag_write_allowlist: tuple[str, ...] = field(default_factory=tuple)
+    write_project_allowlist: tuple[str, ...] | None = None
+
+    @property
+    def restricted_deployment(self) -> bool:
+        return self.write_project_allowlist is not None
 
     @property
     def bridge_enabled(self) -> bool:
@@ -28,8 +36,8 @@ class Settings:
         return any(fnmatch.fnmatch(tag_path, pattern) for pattern in self.tag_write_allowlist)
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
+def _env_bool(env: dict[str, str], name: str, default: bool) -> bool:
+    raw = env.get(name)
     if raw is None:
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
@@ -62,6 +70,20 @@ def load_settings(environ: dict[str, str] | None = None) -> Settings:
         problems.append(f"IGNITION_TIMEOUT_S must be a positive number, got {timeout_raw!r}")
         timeout_s = 30.0
 
+    restricted_raw = env.get("IGNITION_RESTRICTED_DEPLOYMENT", "false").strip().lower()
+    if restricted_raw not in ("1", "true", "yes", "on", "0", "false", "no", "off"):
+        problems.append("IGNITION_RESTRICTED_DEPLOYMENT must be a boolean")
+
+    project_allowlist = None
+    if (
+        _env_bool(env, "IGNITION_RESTRICTED_DEPLOYMENT", False)
+        or "IGNITION_WRITE_PROJECT_ALLOWLIST" in env
+    ):
+        raw = env.get("IGNITION_WRITE_PROJECT_ALLOWLIST", "").strip()
+        project_allowlist = tuple(name.strip() for name in raw.split(",")) if raw else ()
+        if any(not PROJECT_NAME.fullmatch(name) for name in project_allowlist):
+            problems.append("IGNITION_WRITE_PROJECT_ALLOWLIST must contain exact project names")
+
     if problems:
         raise ValueError("Invalid ignition-mcp configuration:\n  - " + "\n  - ".join(problems))
 
@@ -76,8 +98,9 @@ def load_settings(environ: dict[str, str] | None = None) -> Settings:
         gateway_url=gateway_url,
         api_token=api_token,
         bridge_secret=bridge_secret,
-        allow_writes=_env_bool("IGNITION_ALLOW_WRITES", False),
-        tls_verify=_env_bool("IGNITION_TLS_VERIFY", True),
+        allow_writes=_env_bool(env, "IGNITION_ALLOW_WRITES", False),
+        tls_verify=_env_bool(env, "IGNITION_TLS_VERIFY", True),
         timeout_s=timeout_s,
         tag_write_allowlist=allowlist,
+        write_project_allowlist=project_allowlist,
     )

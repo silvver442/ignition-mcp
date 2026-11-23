@@ -8,7 +8,7 @@ from mcp.server.fastmcp import FastMCP
 
 from ..app import AppContext, tool_result
 from ..errors import ValidationError
-from ..guards import require_name_echo, require_writes
+from ..guards import refuse_in_restricted_deployment, require_name_echo, require_writes
 
 
 def register(mcp: FastMCP, ctx: AppContext) -> None:
@@ -102,5 +102,6 @@ def register(mcp: FastMCP, ctx: AppContext) -> None:
     @tool_result(ctx)
     def project_scan() -> dict[str, Any]:
         """Safe trigger, REST plane. Request a scan of external project files."""
+        refuse_in_restricted_deployment(ctx.settings, "project_scan")
         result = ctx.client.scan_projects()
         return {"scan": "requested", "result": result}

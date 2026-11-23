@@ -12,6 +12,32 @@ from ..guards import require_name_echo, require_writes
 from ..perspective.schema import validate_view
 
 PERSPECTIVE = "com.inductiveautomation.perspective"
+PAGE_CONFIG = f"{PERSPECTIVE}/page-config"
+
+
+def _resource_manifest(filename: str) -> dict[str, Any]:
+    return {
+        "scope": "G",
+        "version": 1,
+        "restricted": False,
+        "overridable": True,
+        "files": [filename],
+        "attributes": {},
+    }
+
+
+def _set_page(
+    config: dict[str, Any], path: str, page_url: str, view_path: str, title: str
+) -> None:
+    if not page_url.startswith("/"):
+        raise ValidationError("page_url must start with /")
+    pages = config.get("pages")
+    if not isinstance(pages, dict):
+        raise GatewayError(f"Expected a pages object in {path}")
+    page = pages.get(page_url, {})
+    if not isinstance(page, dict):
+        raise GatewayError(f"Expected an object for page {page_url} in {path}")
+    pages[page_url] = {**page, "viewPath": view_path, "title": title or view_path}
 
 
 def _view_dir(project: str, view_path: str) -> str:
@@ -105,17 +131,7 @@ def register(mcp: FastMCP, ctx: AppContext) -> None:
                 "files/write",
                 {
                     "path": manifest_file,
-                    "content": json.dumps(
-                        {
-                            "scope": "G",
-                            "version": 1,
-                            "restricted": False,
-                            "overridable": True,
-                            "files": ["view.json"],
-                            "attributes": {},
-                        },
-                        indent=2,
-                    ),
+                    "content": json.dumps(_resource_manifest("view.json"), indent=2),
                 },
             )
         scan = ctx.client.scan_projects()
@@ -146,7 +162,7 @@ def register_extra(mcp: FastMCP, ctx: AppContext) -> None:
     @tool_result(ctx)
     def perspective_page_config_get(project: str) -> dict[str, Any]:
         """Read-only, bridge plane."""
-        path = f"{project}/{PERSPECTIVE}/page-config/config.json"
+        path = f"{project}/{PAGE_CONFIG}/config.json"
         return {"project": project, "pages": _read_project_json(ctx, path)}
 
     @mcp.tool()
@@ -158,15 +174,9 @@ def register_extra(mcp: FastMCP, ctx: AppContext) -> None:
         require_writes(ctx.settings, confirm, "perspective_page_config_set")
         if not page_url.startswith("/"):
             raise ValidationError("page_url must start with /")
-        path = f"{project}/{PERSPECTIVE}/page-config/config.json"
+        path = f"{project}/{PAGE_CONFIG}/config.json"
         config = _read_project_json(ctx, path)
-        pages = config.get("pages")
-        if not isinstance(pages, dict):
-            raise GatewayError(f"Expected a pages object in {path}")
-        page = pages.get(page_url, {})
-        if not isinstance(page, dict):
-            raise GatewayError(f"Expected an object for page {page_url} in {path}")
-        pages[page_url] = {**page, "viewPath": view_path, "title": title or view_path}
+        _set_page(config, path, page_url, view_path, title)
         ctx.bridge.call(
             "files/write",
             {

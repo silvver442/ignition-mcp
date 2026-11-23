@@ -125,13 +125,15 @@ def register(mcp: FastMCP, ctx: AppContext) -> None:
             check("license", "warn", exc.message, exc.remediation)
 
         # 6. Write posture (informational)
-        check(
-            "write_mode",
-            "ok" if ctx.settings.allow_writes else "warn",
-            "Writes ENABLED"
-            if ctx.settings.allow_writes
-            else "Read-only mode (IGNITION_ALLOW_WRITES not set) — mutating tools will refuse.",
-        )
+        if not ctx.settings.allow_writes:
+            check("write_mode", "warn", "Read-only mode (IGNITION_ALLOW_WRITES is disabled).")
+        elif ctx.settings.restricted_deployment:
+            if ctx.settings.write_project_allowlist:
+                check("write_mode", "ok", "Writes limited to allowlisted Perspective deployments.")
+            else:
+                check("write_mode", "warn", "Read-only mode (project allowlist is empty).")
+        else:
+            check("write_mode", "ok", "Writes ENABLED")
 
         healthy = all(c["status"] != "fail" for c in checks)
         return {"checks": checks, "healthy": healthy}

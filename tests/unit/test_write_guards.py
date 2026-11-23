@@ -8,15 +8,18 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 import pytest
 
 from ignition_mcp.app import AppContext
+from ignition_mcp.config import load_settings
 from ignition_mcp.tools import (
     alarms,
     bridge_admin,
     database,
+    diagnostics,
     gateway,
     history,
     perspective,
@@ -24,7 +27,9 @@ from ignition_mcp.tools import (
     tags,
 )
 
-TOOL_MODULES = [tags, history, alarms, projects, perspective, gateway, database, bridge_admin]
+TOOL_MODULES = [
+    tags, history, alarms, projects, perspective, gateway, database, bridge_admin, diagnostics
+]
 
 # db_query is only mutating for non-SELECT SQL; it takes confirm but a bare call
 # with confirm=True and a SELECT is legitimately allowed. Exercise it separately.
@@ -108,6 +113,62 @@ def test_db_query_select_allowed_but_update_refused(settings_readonly, mock_clie
     tools = _all_tools(ctx)
     update = tools["db_query"](sql="DELETE FROM t")
     assert update["error"] == "write_not_allowed"
+
+
+def test_restricted_mode_blocks_other_gateway_mutations(app_ctx, mock_client, mock_bridge):
+    app_ctx.settings = replace(app_ctx.settings, write_project_allowlist=("Example",))
+    tools = _all_tools(app_ctx)
+    for name, fn in tools.items():
+        if "confirm" in inspect.signature(fn).parameters and name != "db_query":
+            result = fn(**_dummy_args(fn), confirm=True)
+            assert result["error"] == "write_not_allowed", name
+
+    for result in (
+        tools["db_query"](sql="SELECT 1"),
+        tools["db_query"](sql="DELETE FROM t", confirm=True),
+        tools["db_run_named_query"](project="Example", query_path="Update"),
+        tools["project_scan"](),
+    ):
+        assert result["error"] == "write_not_allowed"
+    assert not mock_client.mock_calls
+    assert not mock_bridge.mock_calls
+
+    mock_client.get_json.return_value = {"items": ["Example", "Other"]}
+    assert tools["project_list"]() == {"projects": ["Example", "Other"]}
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({}, None),
+        ({"IGNITION_RESTRICTED_DEPLOYMENT": "true"}, ()),
+        ({"IGNITION_WRITE_PROJECT_ALLOWLIST": ""}, ()),
+        ({"IGNITION_WRITE_PROJECT_ALLOWLIST": "Example, Other_2"}, ("Example", "Other_2")),
+    ],
+)
+def test_load_project_write_scope(overrides, expected):
+    settings = load_settings({
+        "IGNITION_URL": "http://gw:8088", "IGNITION_API_TOKEN": "test:x",
+        "IGNITION_ALLOW_WRITES": "true", **overrides,
+    })
+    assert settings.allow_writes
+    assert settings.write_project_allowlist == expected
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"IGNITION_WRITE_PROJECT_ALLOWLIST": "*"},
+        {"IGNITION_WRITE_PROJECT_ALLOWLIST": "Example,../Other"},
+        {"IGNITION_WRITE_PROJECT_ALLOWLIST": "Example,"},
+        {"IGNITION_RESTRICTED_DEPLOYMENT": "typo"},
+    ],
+)
+def test_invalid_project_write_scope_rejects_configuration(overrides):
+    with pytest.raises(ValueError, match="IGNITION_(WRITE_PROJECT_ALLOWLIST|RESTRICTED_DEPLOYMENT)"):
+        load_settings({
+            "IGNITION_URL": "http://gw:8088", "IGNITION_API_TOKEN": "test:x", **overrides,
+        })
 
 
 if __name__ == "__main__":

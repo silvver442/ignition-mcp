@@ -2,15 +2,40 @@
 
 from __future__ import annotations
 
-from .config import Settings
+from .config import PROJECT_NAME, Settings
 from .errors import ValidationError, WriteNotAllowedError
 
 
 def require_writes(settings: Settings, confirm: bool, action: str) -> None:
-    """Raise unless writes are globally enabled AND the caller passed confirm=True.
+    """Authorize a write outside the controlled deployment workflow."""
+    refuse_in_restricted_deployment(settings, action)
+    _require_write_confirmation(settings, confirm, action)
 
-    Every mutating tool calls this first, before touching the gateway.
-    """
+
+def refuse_in_restricted_deployment(settings: Settings, action: str) -> None:
+    if settings.restricted_deployment:
+        raise WriteNotAllowedError(
+            f"Refusing '{action}': restricted deployment permits writes only via "
+            "perspective_deploy and perspective_restore."
+        )
+
+
+def require_deployment_write(
+    settings: Settings, project: str, confirm: bool, exclusive_access: bool
+) -> None:
+    _require_write_confirmation(settings, confirm, "Perspective deployment or restore")
+    if not PROJECT_NAME.fullmatch(project):
+        raise ValidationError("Invalid project name")
+    allowlist = settings.write_project_allowlist
+    if allowlist is not None and project not in allowlist:
+        raise WriteNotAllowedError(
+            "Project is not authorized by IGNITION_WRITE_PROJECT_ALLOWLIST."
+        )
+    if exclusive_access is not True:
+        raise ValidationError("Coordinate exclusive project access before writing")
+
+
+def _require_write_confirmation(settings: Settings, confirm: bool, action: str) -> None:
     if not settings.allow_writes:
         raise WriteNotAllowedError(
             f"Refusing '{action}': the server is in read-only mode.",

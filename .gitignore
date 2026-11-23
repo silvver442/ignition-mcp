@@ -16,6 +16,7 @@ htmlcov/
 # Workforce scratch (kept out of the published repo)
 tasks/
 results/
+/backups/
 
 # Secrets — never commit
 *.secret

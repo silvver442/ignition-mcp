@@ -6,7 +6,7 @@ from mcp.server.fastmcp import FastMCP
 
 from ..app import AppContext, tool_result
 from ..errors import ValidationError
-from ..guards import require_writes
+from ..guards import refuse_in_restricted_deployment, require_writes
 
 
 def _first_word(sql: str) -> str:
@@ -31,6 +31,7 @@ def register(mcp: FastMCP, ctx: AppContext) -> None:
         project: str, query_path: str, parameters: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         """Read-only by default, bridge plane. Runs a project Named Query."""
+        refuse_in_restricted_deployment(ctx.settings, "db_run_named_query")
         if not project or not query_path:
             raise ValidationError("project and query_path must be non-empty")
         result = ctx.bridge.call(
@@ -44,6 +45,7 @@ def register(mcp: FastMCP, ctx: AppContext) -> None:
         sql: str, database: str = "", args: list[Any] | None = None, confirm: bool = False
     ) -> dict[str, Any]:
         """Bridge plane. SELECT statements run read-only; any other statement is mutating."""
+        refuse_in_restricted_deployment(ctx.settings, "db_query")
         if not sql:
             raise ValidationError("sql must be non-empty")
         mutating = _first_word(sql) not in {"select", "show", "describe"}
