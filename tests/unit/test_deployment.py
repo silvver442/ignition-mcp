@@ -3,6 +3,7 @@
 import io
 import json
 from dataclasses import replace
+from pathlib import Path
 from zipfile import ZipFile
 
 import httpx
@@ -403,3 +404,198 @@ def test_restore_refuses_bad_checksum_or_later_edits(gateway, mock_bridge, later
     refused = restore(tools, result)
     assert refused["error"] == "deployment_conflict"
     assert not mutations(mock_bridge)
+
+
+@pytest.fixture
+def side_nav(gateway):
+    files, _ = gateway
+    config = json.loads(files[CONFIG])
+    config["pages"]["/codex-test"] = {"viewPath": "CodexMCPTest"}
+    config["sharedDocks"].update(
+        cornerPriority="top-bottom", top=[{"viewPath": "TopNav", "size": 68}],
+        left=[{"viewPath": "ExistingWest", "id": "other"}],
+    )
+    files[CONFIG] = encode(config)
+    files[deployment._SESSION_PATH] = encode({
+        "custom": {"counter": 42},
+        "props": {"locale": "pl-PL"},
+        "propConfig": {"custom.counter": {"persistent": True}, "props.id": {"access": "Private"}},
+    })
+    files[deployment._SESSION_MANIFEST] = encode({
+        "scope": "G", "version": 1, "restricted": False, "overridable": True,
+        "files": ["props.json"],
+        "attributes": {"lastModification": {"actor": "designer", "timestamp": "2026-11-19T20:51:40Z"}},
+    })
+    return {
+        "configure_side_nav": True,
+        "views": [
+            deployment.ViewChange(view_path=path, view_json=VIEW)
+            for path in ("SideNav", "Shared/SideNavArea")
+        ],
+    }
+
+
+@pytest.mark.parametrize("difference", [
+    "metadata", "actor", "manifest", "config", "session_manifest", "stale", "concurrent",
+])
+def test_side_nav_export_bridge_manifest_comparison(
+    gateway, side_nav, mock_bridge, mock_client, difference,
+):
+    files, tools = gateway
+    page_manifest = f"{deployment.PAGE_CONFIG}/resource.json"
+    update_scan_metadata(files, page_manifest, "04")
+    update_scan_metadata(files, deployment._SESSION_MANIFEST, "04")
+    original = mock_bridge.call.side_effect
+    accepted_preview = difference in {"metadata", "stale", "concurrent"}
+    wrote = False
+
+    def bridge(endpoint, payload):
+        nonlocal wrote
+        response = original(endpoint, payload)
+        path = payload["path"].removeprefix(PROJECT + "/")
+        if endpoint == "files/write":
+            wrote = True
+        if endpoint != "files/read":
+            return response
+        if path == CONFIG and difference == "config":
+            config = json.loads(response["content"])
+            config["pages"]["/"]["title"] = "Edited"
+            return {"content": encode(config).decode()}
+        if path == page_manifest or (
+            path == deployment._SESSION_MANIFEST and difference == "session_manifest"
+        ):
+            live = {path: response["content"].encode()}
+            update_scan_metadata(live, path, "06" if difference == "concurrent" and wrote else "05")
+            manifest = json.loads(live[path])
+            if difference == "actor":
+                manifest["attributes"]["lastModification"]["actor"] = "another-actor"
+            elif difference == "manifest":
+                manifest["overridable"] = False
+            return {"content": encode(manifest).decode()}
+        return response
+
+    mock_bridge.call.side_effect = bridge
+    preview = tools["perspective_deploy"](PROJECT, **side_nav)
+    assert not mutations(mock_bridge)
+    if accepted_preview:
+        assert preview["status"] == "dry_run", preview
+        assert set(preview["planned"]) == {CONFIG, deployment._SESSION_PATH} | {
+            f"{PREFIX}/views/{view.view_path}/{name}"
+            for view in side_nav["views"] for name in ("view.json", "resource.json")
+        }
+    else:
+        assert preview["error"] == "deployment_conflict", preview
+    if difference == "stale":
+        files["project.json"] = b'{"title":"Edited"}'
+    result = apply(tools, expected_state=preview["base_state"], **side_nav)
+
+    if difference == "metadata":
+        assert result["status"] == "success", result
+        assert result["verified"] == preview["planned"]
+        assert page_manifest not in result["attempted"]
+        return
+    assert result["error"] == "deployment_conflict", result
+    assert len(mutations(mock_bridge)) == (1 if difference == "concurrent" else 0)
+    mock_client.scan_projects.assert_not_called()
+    if difference == "stale":
+        assert "expected_state" in result["message"]
+    else:
+        path = {"config": CONFIG, "session_manifest": deployment._SESSION_MANIFEST}.get(
+            difference, page_manifest,
+        )
+        assert result["message"] == f"Unexpected live content at {path}"
+
+
+def test_side_nav_plan_apply_and_restore(gateway, side_nav, mock_bridge, mock_client):
+    files, tools = gateway
+    before = files.copy()
+
+    def scan():
+        manifest = json.loads(files[deployment._SESSION_MANIFEST])
+        manifest["attributes"]["lastModification"] = {
+            "actor": "external", "timestamp": "2026-11-23T18:00:00Z",
+        }
+        files[deployment._SESSION_MANIFEST] = encode(manifest)
+
+    mock_client.scan_projects.side_effect = scan
+    preview = tools["perspective_deploy"](PROJECT, **side_nav)
+    assert preview["status"] == "dry_run"
+    assert {CONFIG, deployment._SESSION_PATH} <= set(preview["planned"])
+    assert not mutations(mock_bridge)
+    result = apply(tools, expected_state=preview["base_state"], **side_nav)
+    assert result["status"] == "success", result
+    assert before == deployment._archive(Path(result["backup"]["path"]).read_bytes())
+    original = json.loads(before[CONFIG])
+    config = json.loads(files[CONFIG])
+    dock = config["sharedDocks"]["left"].pop()
+    assert dock == {
+        "anchor": "fixed", "autoBreakpoint": 480, "content": "push", "handle": "hide",
+        "iconUrl": "", "id": "SideNav", "modal": False, "resizable": False,
+        "show": "visible", "size": 232, "viewParams": {}, "viewPath": "SideNav",
+    }
+    assert config == original
+    session = json.loads(files[deployment._SESSION_PATH])
+    assert session["custom"].pop("scadaSelection") == {
+        "line": "Line_1", "tagPath": "Line_1/Line/Ignition",
+    }
+    assert session == json.loads(before[deployment._SESSION_PATH])
+    assert tools["perspective_deploy"](PROJECT, **side_nav)["planned"] == []
+    assert restore(tools, result)["status"] == "success"
+    assert files.keys() == before.keys()
+    assert all(value == files[path] for path, value in before.items()
+               if path != deployment._SESSION_MANIFEST)
+
+
+@pytest.mark.parametrize("conflict", ["dock", "selection", "binding", "manifest", "stale", "no_state"])
+def test_side_nav_rejects_conflicts(gateway, side_nav, mock_bridge, conflict):
+    files, tools = gateway
+    plan = tools["perspective_deploy"](PROJECT, **side_nav)
+    session = json.loads(files[deployment._SESSION_PATH])
+    if conflict == "dock":
+        config = json.loads(files[CONFIG])
+        config["sharedDocks"]["right"] = [{"id": "SideNav", "viewPath": "Other"}]
+        files[CONFIG] = encode(config)
+    elif conflict == "selection":
+        session["custom"]["scadaSelection"] = None
+    elif conflict == "binding":
+        session["propConfig"]["custom.scadaSelection.tagPath"] = {"binding": {}}
+    elif conflict == "manifest":
+        del files[deployment._SESSION_MANIFEST]
+    elif conflict == "stale":
+        session["custom"]["counter"] = 43
+    files[deployment._SESSION_PATH] = encode(session)
+    kwargs = {"expected_state": plan["base_state"]} if conflict == "stale" else {}
+    result = (
+        apply(tools, **kwargs, **side_nav) if conflict in {"stale", "no_state"}
+        else tools["perspective_deploy"](PROJECT, **side_nav)
+    )
+    assert result["status"] == "error"
+    if conflict == "no_state":
+        assert "expected_state" in result["message"]
+    else:
+        assert result["error"] == "deployment_conflict"
+    assert not mutations(mock_bridge)
+
+
+def test_partial_side_nav_write_refuses_automatic_restore(gateway, side_nav, mock_bridge, mock_client):
+    files, tools = gateway
+    before = files.copy()
+    bridge = mock_bridge.call.side_effect
+
+    def fail_after_write(endpoint, payload):
+        result = bridge(endpoint, payload)
+        if endpoint == "files/write" and payload["path"].endswith(deployment._SESSION_PATH):
+            raise httpx.ReadTimeout("session write acknowledgement lost")
+        return result
+
+    plan = tools["perspective_deploy"](PROJECT, **side_nav)
+    mock_bridge.call.side_effect = fail_after_write
+    result = apply(tools, expected_state=plan["base_state"], **side_nav)
+    assert result["status"] == "uncertain"
+    assert result["attempted"] == plan["planned"]
+    assert result["read_back"][-1] == CONFIG
+    assert not result["restore_available"]
+    assert before == deployment._archive(Path(result["backup"]["path"]).read_bytes())
+    assert restore(tools, result)["status"] == "error"
+    assert len(mutations(mock_bridge)) == len(plan["planned"])
+    mock_client.scan_projects.assert_not_called()

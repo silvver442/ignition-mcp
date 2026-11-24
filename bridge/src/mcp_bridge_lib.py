@@ -12,17 +12,36 @@
 
 import hashlib
 import hmac
+import json
+import math
 import os
 import codecs
 import errno
+import re
 import stat
+import threading
 
-BRIDGE_VERSION = '0.1.0'
+BRIDGE_VERSION = '0.1.2'
 
 # Set at install time (bridge_install rewrites this constant, or edit manually).
 BRIDGE_SECRET = '__BRIDGE_SECRET__'
 
 MAX_SKEW_SECONDS = 300
+TAG_CONFIG_ROOTS = frozenset(('[default]Line_1/Cupper/Ignition',))
+TAG_CONFIG_LOCK = threading.RLock()
+TAG_HISTORY_PROPERTIES = frozenset((
+    'historyEnabled', 'historyProvider', 'sampleMode', 'historySampleRate',
+    'historySampleRateUnits', 'historyTagGroup', 'historicalDeadbandStyle',
+    'historicalDeadbandMode', 'historicalDeadband',
+))
+TAG_HISTORY_CHOICES = {
+    'sampleMode': ('OnChange', 'Periodic', 'TagGroup'),
+    'historySampleRateUnits': ('MS', 'SEC', 'MIN', 'HOUR', 'DAY', 'WEEK', 'MONTH', 'YEAR'),
+    'historicalDeadbandStyle': ('Auto', 'Analog_Compressed', 'Discrete'),
+    'historicalDeadbandMode': ('Absolute', 'Percent', 'Off'),
+}
+TAG_READ_PROPERTIES = ('dataType', 'valueSource', 'defaultValue', 'opcServer', 'opcItemPath',
+                       'sourceTagPath', 'tagGroup') + tuple(sorted(TAG_HISTORY_PROPERTIES))
 
 LOGGER = system.util.getLogger('mcp-bridge')
 
@@ -195,6 +214,179 @@ def handle_tags_read(payload):
             'timestamp': _fmt_date(values[i].timestamp)
         })
     return {'tags': tags}
+
+def _scoped_tag_path(path):
+    if not isinstance(path, basestring):
+        raise ValueError('path is required')
+    parent, _, name = path.rpartition('/')
+    if (parent not in TAG_CONFIG_ROOTS
+            or not re.match(r'^[A-Za-z_][A-Za-z0-9_]{0,254}\Z', name)
+            or name.lower() in ('plc', '_types_')):
+        raise ValueError('Expected a direct tag under an approved Ignition folder')
+    folder = '[default]'
+    for segment in parent[len(folder):].split('/'):
+        node = _scoped_find_child(folder, segment)
+        if node != 'Folder':
+            raise ValueError('The approved path must consist of existing ordinary folders')
+        delimiter = '' if folder == '[default]' else '/'
+        folder += delimiter + segment
+    return parent, name
+
+
+def _scoped_find_child(parent, name):
+    matches = [node for node in system.tag.browse(parent).getResults()
+               if unicode(node['name']).lower() == name.lower()]
+    if not matches:
+        return None
+    if len(matches) != 1 or unicode(matches[0]['name']) != name:
+        raise ValueError('Tag or folder name differs in case or is ambiguous')
+    return str(matches[0]['tagType'])
+
+
+def _scoped_export_config(path, name):
+    # Ignition's own exporter handles tag property types before Jython sees them.
+    exported = json.loads(system.tag.exportTags(tagPaths=[path], recursive=False, exportType='json'))
+    if not isinstance(exported, dict):
+        raise ValueError('Expected a JSON tag export object')
+    if 'tags' in exported:
+        tags = exported['tags']
+        if not isinstance(tags, list) or len(tags) != 1:
+            raise ValueError('Expected exactly one tag in the JSON export')
+        config = tags[0]
+    else:
+        config = exported
+    if (not isinstance(config, dict) or config.get('name') != name
+            or config.get('tagType', 'AtomicTag') != 'AtomicTag' or 'tags' in config):
+        raise ValueError('Unexpected tag configuration in the JSON export')
+    return config
+
+
+def _scoped_tag_snapshot(path, parent, name):
+    kind = _scoped_find_child(parent, name)
+    if kind is None:
+        return {'path': path, 'config': None, 'effective': {}, 'value': None, 'valueGood': False}
+    if kind != 'AtomicTag':
+        raise ValueError('Only standalone atomic tags are supported')
+    config = _scoped_export_config(path, name)
+    values = system.tag.readBlocking([path] + [path + '.' + prop for prop in TAG_READ_PROPERTIES])
+    effective = {}
+    for index, prop in enumerate(TAG_READ_PROPERTIES, 1):
+        datum = values[index]
+        if datum.quality.isGood():
+            effective[prop] = _json_safe(datum.value)
+    return {'path': path, 'config': config, 'effective': effective,
+            'value': _json_safe(values[0].value), 'valueGood': values[0].quality.isGood()}
+
+
+def handle_tags_scoped_state(payload):
+    path = payload.get('path')
+    with TAG_CONFIG_LOCK:
+        parent, name = _scoped_tag_path(path)
+        return _scoped_tag_snapshot(path, parent, name)
+
+
+def _scoped_result(results):
+    failure = 'Tag operation did not return one Good result'
+    if results is None:
+        raise ValueError(failure + ' (result=null)')
+    try:
+        count = len(results)
+    except TypeError:
+        raise ValueError(failure + ' (result is not a list)')
+
+    codes = []
+    for index in range(min(count, 8)):
+        try:
+            code = results[index]
+            if code is None:
+                codes.append('null')
+                continue
+            if count == 1 and code.isGood():
+                return
+            # The SDK name and number exclude the arbitrary diagnostic message.
+            codes.append('%s (%d)' % (code.getName(), code.getCode()))
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+            codes.append('invalid QualityCode')
+    if count > len(codes):
+        codes.append('%d more' % (count - len(codes)))
+    raise ValueError('%s (count=%d, quality=[%s])' % (failure, count, ', '.join(codes)))
+
+
+def _valid_history_patch(patch):
+    if not isinstance(patch, dict) or not patch or not set(patch).issubset(TAG_HISTORY_PROPERTIES):
+        return False
+    for key, value in patch.items():
+        if key in TAG_HISTORY_CHOICES:
+            valid = value in TAG_HISTORY_CHOICES[key]
+        elif key == 'historyEnabled':
+            valid = isinstance(value, bool)
+        elif key == 'historySampleRate':
+            valid = isinstance(value, (int, long)) and not isinstance(value, bool) and 0 < value < 2 ** 31
+        elif key == 'historicalDeadband':
+            valid = (isinstance(value, (int, long, float)) and not isinstance(value, bool)
+                     and 0 <= value and not math.isinf(value))
+        else:
+            valid = isinstance(value, basestring) and 0 < len(value.strip()) <= 255
+        if not valid:
+            return False
+    return True
+
+
+def handle_tags_scoped_configure(payload):
+    path = payload.get('path')
+    action = payload.get('action')
+    with TAG_CONFIG_LOCK:
+        parent, name = _scoped_tag_path(path)
+        before = _scoped_tag_snapshot(path, parent, name)
+        if 'expectedConfig' not in payload or before['config'] != payload['expectedConfig']:
+            raise ValueError('Tag configuration changed before the write')
+        if action == 'create':
+            data_type = payload.get('dataType')
+            value = payload.get('value')
+            bits = {'Int4': 32, 'Int8': 64}.get(data_type)
+            if (before['config'] is not None or bits is None or isinstance(value, bool)
+                    or not isinstance(value, (int, long)) or not -(2 ** (bits - 1)) <= value < 2 ** (bits - 1)):
+                raise ValueError('Expected an absent tag and a valid Memory integer')
+            patch = {'tagType': 'AtomicTag', 'dataType': data_type, 'valueSource': 'memory',
+                     'historyEnabled': False, 'value': value}
+            policy = 'a'
+        elif action == 'history':
+            patch = payload.get('history')
+            if before['config'] is None or not _valid_history_patch(patch):
+                raise ValueError('Expected an existing tag and a scalar history patch')
+            policy = 'm'
+        else:
+            raise ValueError('Unsupported tag configuration operation')
+        _scoped_result(system.tag.configure(parent, [dict(patch, name=name)], policy))
+        return _scoped_tag_snapshot(path, parent, name)
+
+
+def handle_tags_scoped_restore(payload):
+    path = payload.get('path')
+    with TAG_CONFIG_LOCK:
+        parent, name = _scoped_tag_path(path)
+        current = _scoped_tag_snapshot(path, parent, name)
+        if ('beforeConfig' not in payload or current['config'] is None
+                or current['config'] != payload.get('expectedConfig')):
+            raise ValueError('Tag configuration changed before restore')
+        prior = payload['beforeConfig']
+        source = str(current['effective'].get('valueSource', current['config'].get('valueSource'))).lower()
+        if prior is None or source == 'memory':
+            if (source != 'memory' or not current['valueGood']
+                    or 'expectedValue' not in payload or current['value'] != payload['expectedValue']):
+                raise ValueError('Memory tag value changed before restore')
+        if prior is None:
+            data_type = current['effective'].get('dataType', current['config'].get('dataType'))
+            history = current['effective'].get('historyEnabled', current['config'].get('historyEnabled'))
+            if data_type not in ('Int4', 'Int8') or history is not False:
+                raise ValueError('Only verified Memory integer creations with history disabled can be undone')
+            _scoped_result(system.tag.deleteTags([path]))
+        else:
+            if (not isinstance(prior, dict) or prior.get('name') != name
+                    or prior.get('tagType', 'AtomicTag') != 'AtomicTag' or 'tags' in prior):
+                raise ValueError('Restore requires the original atomic tag configuration')
+            _scoped_result(system.tag.configure(parent, [prior], 'o'))
+        return _scoped_tag_snapshot(path, parent, name)
 
 def handle_tags_write(payload):
     writes = payload.get('writes') or []
@@ -465,6 +657,9 @@ HANDLERS = {
     'tags/read': handle_tags_read,
     'tags/write': handle_tags_write,
     'tags/configure': handle_tags_configure,
+    'tags/scoped-state': handle_tags_scoped_state,
+    'tags/scoped-configure': handle_tags_scoped_configure,
+    'tags/scoped-restore': handle_tags_scoped_restore,
     'history/query': handle_history_query,
     'history/providers': handle_history_providers,
     'alarms/status': handle_alarms_status,

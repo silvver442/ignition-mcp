@@ -8,6 +8,7 @@ import re
 from dataclasses import dataclass, field
 
 PROJECT_NAME = re.compile(r"[A-Za-z0-9_]+")
+TAG_CONFIG_ROOT = re.compile(r"\[default\](?:[A-Za-z0-9_]+/)*[A-Za-z0-9_]+")
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,7 @@ class Settings:
     timeout_s: float = 30.0
     tag_write_allowlist: tuple[str, ...] = field(default_factory=tuple)
     write_project_allowlist: tuple[str, ...] | None = None
+    tag_config_allowlist: tuple[str, ...] = ()
 
     @property
     def restricted_deployment(self) -> bool:
@@ -84,6 +86,15 @@ def load_settings(environ: dict[str, str] | None = None) -> Settings:
         if any(not PROJECT_NAME.fullmatch(name) for name in project_allowlist):
             problems.append("IGNITION_WRITE_PROJECT_ALLOWLIST must contain exact project names")
 
+    config_raw = env.get("IGNITION_TAG_CONFIG_ALLOWLIST", "").strip()
+    tag_config_allowlist = tuple(path.strip() for path in config_raw.split(",")) if config_raw else ()
+    if any(
+        not TAG_CONFIG_ROOT.fullmatch(path)
+        or {"plc", "_types_"}.intersection(path[9:].lower().split("/"))
+        for path in tag_config_allowlist
+    ):
+        problems.append("IGNITION_TAG_CONFIG_ALLOWLIST must contain exact non-PLC folder paths")
+
     if problems:
         raise ValueError("Invalid ignition-mcp configuration:\n  - " + "\n  - ".join(problems))
 
@@ -103,4 +114,5 @@ def load_settings(environ: dict[str, str] | None = None) -> Settings:
         timeout_s=timeout_s,
         tag_write_allowlist=allowlist,
         write_project_allowlist=project_allowlist,
+        tag_config_allowlist=tag_config_allowlist,
     )

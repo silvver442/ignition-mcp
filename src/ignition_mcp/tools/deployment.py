@@ -32,6 +32,18 @@ PATCH = dict[str, bytes | None]
 _LOCK = Lock()
 _VERIFY_ATTEMPTS = 4
 _VERIFY_DELAY = 0.5
+_PAGE_MANIFEST = f"{PAGE_CONFIG}/resource.json"
+_SESSION_PROPS = f"{PERSPECTIVE}/session-props"
+_SESSION_PATH = f"{_SESSION_PROPS}/props.json"
+_SESSION_MANIFEST = f"{_SESSION_PROPS}/resource.json"
+_SIDENAV_VIEWS = ("SideNav", "Shared/SideNavArea")
+_SELECTION_KEY = "scadaSelection"
+_SELECTION_DEFAULT = {"line": "Line_1", "tagPath": "Line_1/Line/Ignition"}
+_SIDENAV_DOCK = {
+    "anchor": "fixed", "autoBreakpoint": 480, "content": "push", "handle": "hide",
+    "iconUrl": "", "id": "SideNav", "modal": False, "resizable": False,
+    "show": "visible", "size": 232, "viewParams": {}, "viewPath": "SideNav",
+}
 
 
 class ViewChange(BaseModel):
@@ -81,7 +93,7 @@ def _object(data: bytes, path: str) -> dict[str, Any]:
     return value
 
 
-def _without_scan_metadata(content: bytes, path: str) -> str:
+def _without_scan_metadata(content: bytes, path: str, *, drop_actor: bool = False) -> str:
     manifest = _object(content, path)
     # Ignition 8.3 can refresh these fields during a project scan.
     attributes = manifest.get("attributes")
@@ -90,15 +102,26 @@ def _without_scan_metadata(content: bytes, path: str) -> str:
         modification = attributes.get("lastModification")
         if isinstance(modification, dict):
             modification.pop("timestamp", None)
+            if drop_actor:
+                modification.pop("actor", None)
     return json.dumps(manifest, sort_keys=True)
 
 
-def _matches_after_scan(path: str, expected: bytes | None, actual: bytes | None) -> bool:
+def _matches_after_scan(
+    path: str, expected: bytes | None, actual: bytes | None, *, session_edit: bool = False,
+) -> bool:
     if expected == actual:
         return True
     if expected is None or actual is None:
         return False
-    if path == f"{PAGE_CONFIG}/resource.json" or re.fullmatch(
+    if path == _SESSION_MANIFEST and session_edit:
+        attributes = _object(actual, path).get("attributes")
+        modification = attributes.get("lastModification") if isinstance(attributes, dict) else None
+        external = isinstance(modification, dict) and modification.get("actor") == "external"
+        return _without_scan_metadata(expected, path, drop_actor=external) == (
+            _without_scan_metadata(actual, path, drop_actor=external)
+        )
+    if path in {_PAGE_MANIFEST, _SESSION_MANIFEST} or re.fullmatch(
         rf"{re.escape(PERSPECTIVE)}/views/.+/resource\.json", path
     ):
         return _without_scan_metadata(expected, path) == _without_scan_metadata(actual, path)
@@ -184,7 +207,10 @@ def _check_inventory(ctx: AppContext, project: str, files: FILES) -> None:
         raise Conflict("Gateway project inventory differs from the export")
 
 
-def _plan(before: FILES, views: list[ViewChange], pages: list[PageChange]) -> PATCH:
+def _plan(
+    before: FILES, views: list[ViewChange], pages: list[PageChange],
+    configure_side_nav: bool = False,
+) -> PATCH:
     changes: PATCH = {}
     view_paths: set[str] = set()
     page_urls: set[str] = set()
@@ -198,8 +224,10 @@ def _plan(before: FILES, views: list[ViewChange], pages: list[PageChange]) -> PA
         folder = f"{PERSPECTIVE}/views/{view.view_path}"
         _stage_resource(before, changes, folder, "view.json", view.view_json)
 
-    if pages:
+    if pages or configure_side_nav:
         path = f"{PAGE_CONFIG}/config.json"
+        if configure_side_nav and path not in before:
+            raise Conflict("SideNav requires existing local Perspective page configuration")
         if path not in before and _object(before["project.json"], "project.json").get("parent"):
             raise Conflict("Cannot initialize local page configuration with a parent project")
         config = _object(before[path], path) if path in before else {"pages": {}}
@@ -208,8 +236,59 @@ def _plan(before: FILES, views: list[ViewChange], pages: list[PageChange]) -> PA
                 raise ValidationError("Page URLs must be unique and target a relative view path")
             page_urls.add(page.page_url)
             _set_page(config, path, page.page_url, page.view_path, page.title)
+        if configure_side_nav:
+            for view_path in _SIDENAV_VIEWS:
+                folder = f"{PERSPECTIVE}/views/{view_path}"
+                if any(f"{folder}/{name}" not in (before.keys() | changes.keys())
+                       for name in ("view.json", "resource.json")):
+                    raise Conflict(f"SideNav view is missing: {view_path}")
+            _add_side_nav_dock(config)
         _stage_resource(before, changes, PAGE_CONFIG, "config.json", config)
+    if configure_side_nav:
+        _stage_scada_selection(before, changes)
     return changes
+
+
+def _add_side_nav_dock(config: dict[str, Any]) -> None:
+    shared = config.get("sharedDocks")
+    if not isinstance(config.get("pages"), dict) or not isinstance(shared, dict):
+        raise Conflict("Unsupported Perspective page configuration")
+    matches = []
+    for side in ("top", "bottom", "left", "right"):
+        docks = shared.get(side, [])
+        if not isinstance(docks, list) or any(not isinstance(dock, dict) for dock in docks):
+            raise Conflict(f"Invalid shared dock list: {side}")
+        matches.extend(
+            (side, dock) for dock in docks
+            if dock.get("id") == "SideNav" or dock.get("viewPath") == "SideNav"
+        )
+    if matches:
+        if matches != [("left", _SIDENAV_DOCK)]:
+            raise Conflict("Existing shared SideNav dock conflicts with the requested dock")
+        return
+    shared.setdefault("left", []).append(_SIDENAV_DOCK.copy())
+
+
+def _stage_scada_selection(before: FILES, changes: PATCH) -> None:
+    if _SESSION_PATH not in before or _SESSION_MANIFEST not in before:
+        raise Conflict("SideNav requires an existing local Perspective session-props resource")
+    manifest = _object(before[_SESSION_MANIFEST], _SESSION_MANIFEST)
+    if manifest.get("scope") != "G" or manifest.get("version") != 1 or (
+        manifest.get("files") != ["props.json"]
+    ):
+        raise Conflict("Unsupported Perspective session-props manifest")
+    props = _object(before[_SESSION_PATH], _SESSION_PATH)
+    custom = props.get("custom")
+    config = props.get("propConfig")
+    if not all(isinstance(value, dict) for value in (custom, config, props.get("props"))):
+        raise Conflict("Unsupported Perspective session properties format")
+    path = f"custom.{_SELECTION_KEY}"
+    if any(key == "custom" or key == path or key.startswith(path + ".") for key in config):
+        raise Conflict("Existing property configuration controls custom.scadaSelection")
+    if _SELECTION_KEY in custom and custom[_SELECTION_KEY] != _SELECTION_DEFAULT:
+        raise Conflict("Existing custom.scadaSelection conflicts with the requested default")
+    custom[_SELECTION_KEY] = _SELECTION_DEFAULT.copy()
+    _stage_resource(before, changes, _SESSION_PROPS, "props.json", props)
 
 
 def _stage_resource(
@@ -232,16 +311,24 @@ def _stage_resource(
 
 
 def _check_paths(
-    ctx: AppContext, project: str, expected: PATCH, *, after_scan: bool = False
-) -> None:
+    ctx: AppContext, project: str, expected: PATCH, *, after_scan: bool = False,
+    session_edit: bool = False, export_page_manifest: bool = False,
+) -> PATCH:
+    observed: PATCH = {}
     for path, content in expected.items():
         try:
             actual = _read_project_file(ctx, f"{project}/{path}").encode()
         except NotFoundError:
             actual = None
-        matches = _matches_after_scan(path, content, actual) if after_scan else actual == content
+        compare_manifest = export_page_manifest and path == _PAGE_MANIFEST
+        matches = (
+            _matches_after_scan(path, content, actual, session_edit=session_edit)
+            if after_scan or compare_manifest else actual == content
+        )
         if not matches:
             raise Conflict(f"Unexpected live content at {path}")
+        observed[path] = actual
+    return observed
 
 
 def _live_preconditions(before: FILES, changes: PATCH) -> PATCH:
@@ -278,15 +365,22 @@ def _apply_patch(before: FILES, changes: PATCH) -> FILES:
     return expected
 
 
-def _verify(ctx: AppContext, project: str, expected: FILES, changes: PATCH) -> FILES:
-    _check_paths(ctx, project, changes, after_scan=True)
+def _verify(
+    ctx: AppContext, project: str, expected: FILES, changes: PATCH, *, session_edit: bool = False,
+    export_page_manifest: bool = False,
+) -> FILES:
+    _check_paths(ctx, project, changes, after_scan=True, session_edit=session_edit)
     for attempt in range(_VERIFY_ATTEMPTS):
         _, actual = _export(ctx, project)
         if actual.keys() == expected.keys() and all(
-            _matches_after_scan(path, content, actual[path]) for path, content in expected.items()
+            _matches_after_scan(path, content, actual[path], session_edit=session_edit)
+            for path, content in expected.items()
         ):
             _check_inventory(ctx, project, actual)
-            _check_paths(ctx, project, {path: actual.get(path) for path in changes})
+            _check_paths(
+                ctx, project, {path: actual.get(path) for path in changes},
+                export_page_manifest=export_page_manifest,
+            )
             return actual
         if attempt + 1 < _VERIFY_ATTEMPTS:
             time.sleep(_VERIFY_DELAY)
@@ -295,7 +389,7 @@ def _verify(ctx: AppContext, project: str, expected: FILES, changes: PATCH) -> F
 
 def _execute(
     ctx: AppContext, root: Path, project: str, data: bytes, before: FILES, changes: PATCH,
-    report: dict[str, Any],
+    report: dict[str, Any], *, export_page_manifest: bool = False,
 ) -> None:
     report["phase"] = "backup"
     backup = _save_backup(root, project, data)
@@ -310,7 +404,11 @@ def _execute(
     live = _live_preconditions(before, changes)
     for path, content in changes.items():
         report["phase"] = "preflight"
-        _check_paths(ctx, project, live)
+        # Pin the Bridge bytes before the first write. Subsequent preconditions
+        # compare Bridge reads byte-for-byte, including manifest metadata.
+        live = _check_paths(
+            ctx, project, live, export_page_manifest=export_page_manifest and not report["attempted"],
+        )
         report["phase"] = "write"
         report["attempted"].append(path)
         target = f"{project}/{path}"
@@ -332,7 +430,10 @@ def _execute(
     report["phase"] = "scan"
     ctx.client.scan_projects()
     report["phase"] = "verification"
-    actual = _verify(ctx, project, expected, live)
+    actual = _verify(
+        ctx, project, expected, live, session_edit=_SESSION_PATH in changes,
+        export_page_manifest=export_page_manifest,
+    )
     report["verified"] = list(changes)
     report["phase"] = "receipt"
     receipt = {
@@ -352,7 +453,7 @@ def register(mcp: FastMCP, ctx: AppContext, backup_root: Path | None = None) -> 
     def run(
         project: str, dry_run: bool, confirm: bool, exclusive_access: bool,
         views: list[ViewChange], pages: list[PageChange], expected_state: str,
-        backup_id: str = "", backup_sha256: str = "",
+        backup_id: str = "", backup_sha256: str = "", configure_side_nav: bool = False,
     ) -> dict[str, Any]:
         report: dict[str, Any] = {
             "project": project, "phase": "planning", "attempted": [], "acknowledged": [],
@@ -364,6 +465,8 @@ def register(mcp: FastMCP, ctx: AppContext, backup_root: Path | None = None) -> 
                 raise ValidationError("Invalid project name")
             if not dry_run:
                 require_deployment_write(ctx.settings, project, confirm, exclusive_access)
+                if configure_side_nav and not expected_state:
+                    raise ValidationError("SideNav deployment requires expected_state from dry-run")
             with _LOCK:
                 data, before = _export(ctx, project)
                 _check_inventory(ctx, project, before)
@@ -374,18 +477,26 @@ def register(mcp: FastMCP, ctx: AppContext, backup_root: Path | None = None) -> 
                 if backup_id:
                     changes = _restore_plan(ctx, root, project, backup_id, backup_sha256, before)
                 else:
-                    changes = _plan(before, views, pages)
+                    changes = _plan(before, views, pages, configure_side_nav)
                 report["planned"] = list(changes)
                 if not dry_run and ctx.settings.restricted_deployment:
                     _check_write_scope(changes)
+                export_page_manifest = (
+                    not backup_id and f"{PAGE_CONFIG}/config.json" in changes
+                    and _PAGE_MANIFEST in before and _PAGE_MANIFEST not in changes
+                )
                 if dry_run or not changes:
-                    _check_paths(ctx, project, _live_preconditions(before, changes))
+                    _check_paths(
+                        ctx, project, _live_preconditions(before, changes),
+                        export_page_manifest=export_page_manifest,
+                    )
                     return {**report, "status": "dry_run" if dry_run else "no_changes"}
-                _execute(ctx, root, project, data, before, changes, report)
+                _execute(
+                    ctx, root, project, data, before, changes, report,
+                    export_page_manifest=export_page_manifest,
+                )
         except (IgnitionMcpError, httpx.HTTPError, OSError, UnicodeError) as exc:
-            uncertain = report["attempted"] and (
-                not isinstance(exc, Conflict) or report["phase"] == "verification"
-            )
+            uncertain = bool(report["attempted"])
             report.update(status="uncertain" if uncertain else "error", message=str(exc))
             if isinstance(exc, IgnitionMcpError):
                 report["error"] = exc.code
@@ -401,13 +512,16 @@ def register(mcp: FastMCP, ctx: AppContext, backup_root: Path | None = None) -> 
         confirm: bool = False,
         expected_state: str = "",
         exclusive_access: bool = False,
+        configure_side_nav: bool = False,
     ) -> dict[str, Any]:
         """Plan or apply Perspective changes to an existing project with a verified ZIP backup.
         Set expected_state to the base_state from dry_run to pin the reviewed project version.
         exclusive_access attests that other project editors have been coordinated.
+        configure_side_nav adds the shared West Dock and scadaSelection to the same plan.
         """
         return run(
-            project, dry_run, confirm, exclusive_access, views or [], pages or [], expected_state
+            project, dry_run, confirm, exclusive_access, views or [], pages or [], expected_state,
+            configure_side_nav=configure_side_nav,
         )
 
     @mcp.tool()
@@ -453,7 +567,10 @@ def _restore_plan(
         if _matches_after_scan(path, original.get(path), current.get(path)):
             continue
         if not (
-            path in {f"{PAGE_CONFIG}/config.json", f"{PAGE_CONFIG}/resource.json"}
+            path in {
+                f"{PAGE_CONFIG}/config.json", f"{PAGE_CONFIG}/resource.json",
+                _SESSION_PATH, _SESSION_MANIFEST,
+            }
             or re.fullmatch(rf"{re.escape(PERSPECTIVE)}/views/.+/(view|resource)\.json", path)
         ):
             raise Conflict(f"Backup differs outside the supported Perspective resources: {path}")

@@ -35,6 +35,11 @@ def require_deployment_write(
         raise ValidationError("Coordinate exclusive project access before writing")
 
 
+def require_tag_configuration_write(settings: Settings, confirm: bool) -> None:
+    """Permit the scoped configuration workflow without enabling generic writes."""
+    _require_write_confirmation(settings, confirm, "Scoped tag configuration")
+
+
 def _require_write_confirmation(settings: Settings, confirm: bool, action: str) -> None:
     if not settings.allow_writes:
         raise WriteNotAllowedError(

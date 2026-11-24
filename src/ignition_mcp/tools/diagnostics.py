@@ -127,6 +127,12 @@ def register(mcp: FastMCP, ctx: AppContext) -> None:
         # 6. Write posture (informational)
         if not ctx.settings.allow_writes:
             check("write_mode", "warn", "Read-only mode (IGNITION_ALLOW_WRITES is disabled).")
+        elif ctx.settings.restricted_deployment and ctx.settings.tag_config_allowlist:
+            checks.append({
+                "check": "write_mode",
+                "status": "ok",
+                "detail": "Writes limited to allowlisted Perspective deployments and tag configurations.",
+            })
         elif ctx.settings.restricted_deployment:
             if ctx.settings.write_project_allowlist:
                 check("write_mode", "ok", "Writes limited to allowlisted Perspective deployments.")

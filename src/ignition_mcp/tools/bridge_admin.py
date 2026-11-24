@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import hashlib
 import io
 import re
 import zipfile
@@ -12,11 +14,24 @@ from mcp.server.fastmcp import FastMCP
 
 from ..app import AppContext, tool_result
 from ..bridge import MIN_BRIDGE_VERSION
-from ..errors import BridgeUnavailableError, ValidationError
+from ..errors import BridgeUnavailableError, GatewayError, IgnitionMcpError, ValidationError
 from ..guards import require_writes
 
 SECRET_PLACEHOLDER = "__BRIDGE_SECRET__"
 LIB_ARCNAME = "ignition/script-python/mcp_bridge_lib/code.py"
+BRIDGE_PROJECT_LIBRARY = f"mcp-bridge/{LIB_ARCNAME}"
+LOCAL_LIBRARY = Path(__file__).resolve().parents[3] / "bridge" / "src" / "mcp_bridge_lib.py"
+
+
+def _scoped_result_fingerprint(source: str) -> tuple[str, str]:
+    tree = ast.parse(source)
+    version, = (ast.literal_eval(node.value) for node in tree.body if isinstance(node, ast.Assign)
+                and any(isinstance(target, ast.Name) and target.id == "BRIDGE_VERSION"
+                        for target in node.targets))
+    if not isinstance(version, str) or not re.fullmatch(r"[0-9]{1,5}(?:\.[0-9]{1,5}){2}", version):
+        raise ValueError("Invalid Bridge version")
+    result, = (node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_scoped_result")
+    return version, hashlib.sha256(ast.dump(result).encode()).hexdigest()
 
 # Matches only the `BRIDGE_SECRET = '__BRIDGE_SECRET__'` assignment line, not the
 # gateway-side "is this configured?" guard that also references the placeholder
@@ -69,6 +84,21 @@ def _zip_with_secret(secret: str) -> bytes:
 
 
 def register(mcp: FastMCP, ctx: AppContext) -> None:
+    @mcp.tool()
+    @tool_result(ctx)
+    def bridge_scoped_result_verify() -> dict[str, Any]:
+        """Compare only _scoped_result with the local fork via a signed, fixed-path Bridge read."""
+        try:
+            runtime = ctx.bridge.ping().get("version")
+            reply = ctx.bridge.call("files/read", {"path": BRIDGE_PROJECT_LIBRARY})
+            live_version, live_hash = _scoped_result_fingerprint(reply["content"])
+            _, reference_hash = _scoped_result_fingerprint(LOCAL_LIBRARY.read_text(encoding="utf-8"))
+        except (IgnitionMcpError, OSError, SyntaxError, ValueError, TypeError, KeyError, RecursionError):
+            raise GatewayError("Unable to compare the signed Bridge library read with the local fork") from None
+        return {"library_version": live_version, "runtime_matches_library": runtime == live_version,
+                "scoped_result_matches_fork": live_hash == reference_hash,
+                "scoped_result_sha256": live_hash, "fork_sha256": reference_hash}
+
     @mcp.tool()
     @tool_result(ctx)
     def bridge_install(confirm: bool = False) -> dict[str, Any]:

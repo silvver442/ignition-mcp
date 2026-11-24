@@ -48,12 +48,14 @@ def build_server() -> FastMCP:
         history,
         perspective,
         projects,
+        scoped_tags,
         tags,
     )
 
     for module in (
         diagnostics,
         tags,
+        scoped_tags,
         history,
         alarms,
         projects,

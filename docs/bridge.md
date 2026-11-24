@@ -36,6 +36,9 @@ the archive ships with a `__BRIDGE_SECRET__` placeholder that gets substituted a
 
 ## Automatic install (recommended)
 
+For an existing 0.1.0 bridge on the test gateway, follow the
+[single-library upgrade](bridge-upgrade-011.md).
+
 With `IGNITION_ALLOW_WRITES=true` and `IGNITION_BRIDGE_SECRET` set, ask your assistant to run the
 `bridge_install` tool. It substitutes your secret into a copy of the archive, imports it as
 project `mcp-bridge` via the REST API, triggers a project scan, and verifies the result with a
@@ -67,11 +70,40 @@ All are `POST` and all require the signed envelope described above.
 |---|---|
 | `ping` | version and capability list |
 | `tags/browse`, `tags/read`, `tags/write`, `tags/configure` | tag operations |
+| `tags/scoped-state`, `tags/scoped-configure`, `tags/scoped-restore` | verified configuration of individual test tags |
 | `history/query`, `history/providers` | tag history |
 | `alarms/status`, `alarms/journal`, `alarms/ack` | alarms |
 | `db/named-query`, `db/query` | database access |
 | `files/list`, `files/read`, `files/write`, `files/delete` | project files, jailed to `data/projects/` |
 | `trial/reset` | reset the gateway trial timer, for development gateways running under a trial license |
+
+## Scoped test tag configuration
+
+The restricted MCP profile uses `IGNITION_TAG_CONFIG_ALLOWLIST` independently of
+the Perspective project allowlist and the legacy tag-value write allowlist. On
+the test launcher it contains `[default]Line_1/Cupper/Ignition`. Bridge 0.1.1
+enforces the same initial scope and checks that every ancestor is an existing
+ordinary folder. The scoped tools accept individual atomic tags directly in the
+folder.
+
+- `tag_config_get` returns the tag configuration, effective properties, and a
+  state fingerprint. Use it for `Status`, `Speed` and `Production` before making
+  any decision about the simulator.
+- `tag_configure_scoped` in `create` mode creates a Memory integer tag with
+  history disabled and aborts on a collision. In `history` mode it merges only the
+  supplied history fields and requires the state from `tag_config_get`.
+- The server saves and verifies `backups/mcp-tag-config/<id>/before.json` before
+  the mutation. A separate readback must match before the server creates its
+  signed verification receipt and offers `tag_config_restore`. Restore checks
+  the backup hash and the current configuration and backs up the current state
+  before writing. Undoing a creation is limited to the tag in its verified
+  receipt and requires the Memory value to still match.
+
+The client must reconnect to load the updated MCP tool list. Before enabling the
+new writes, verify that the installed WebDev project reports all three scoped
+capabilities in `bridge_status`. The local bridge ZIP contains a secret
+placeholder. Continue to use the existing secret mechanism for the installed
+bridge.
 
 ## Troubleshooting
 
