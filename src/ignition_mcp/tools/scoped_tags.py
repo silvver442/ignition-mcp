@@ -30,7 +30,7 @@ SCOPED_ENDPOINTS = {"tags/scoped-state", "tags/scoped-configure", "tags/scoped-r
 SOURCE_TEST_PATH = CUPPER_FOLDER + "MCP_Test_SourceMigration"
 SOURCE_TEST_ENDPOINT = "tags/scoped-cupper-source-test"
 SOURCE_TEST_VERSION = "0.1.8"
-SPEED_MIGRATION_BRIDGE_VERSIONS = ("0.1.9", "0.1.10")
+SPEED_MIGRATION_BRIDGE_VERSIONS = ("0.1.9", "0.1.10", "0.1.11", "0.1.12")
 SOURCE_TEST_DIAGNOSTICS = frozenset({
     "name_collision", "invalid_path", "invalid_expression", "invalid_data_type", "invalid_tag_group",
     "invalid_json", "permission_denied", "redacted",
@@ -181,7 +181,8 @@ def _source_test_capabilities(ctx: AppContext, exclusive_access: bool) -> None:
     if (runtime.get("version") not in (SOURCE_TEST_VERSION, *SPEED_MIGRATION_BRIDGE_VERSIONS)
             or not isinstance(caps, list)
             or not (SCOPED_ENDPOINTS | {SOURCE_TEST_ENDPOINT}).issubset(caps)):
-        raise GatewayError("The dedicated test requires Bridge 0.1.8, 0.1.9 or 0.1.10 and its scoped routes")
+        versions = ", ".join((SOURCE_TEST_VERSION, *SPEED_MIGRATION_BRIDGE_VERSIONS))
+        raise GatewayError(f"The dedicated test requires Bridge {versions} and its scoped routes")
 
 
 def _source_test_result(result: Any, *, creation: bool) -> bool:
@@ -260,7 +261,8 @@ def _cupper_capabilities(ctx: AppContext, *, preparing_speed: bool = False) -> N
     if not isinstance(caps, list) or not expected.issubset(caps):
         raise GatewayError("Bridge 0.1.4 with scoped Cupper validation and raw history is required")
     if preparing_speed and runtime.get("version") not in SPEED_MIGRATION_BRIDGE_VERSIONS:
-        raise GatewayError("Speed migration requires active Bridge 0.1.9 or 0.1.10")
+        versions = ", ".join(SPEED_MIGRATION_BRIDGE_VERSIONS)
+        raise GatewayError(f"Speed migration requires active Bridge {versions}")
 
 
 def _verify_cupper(ctx: AppContext, reference: dict[str, Any], after: dict[str, Any],

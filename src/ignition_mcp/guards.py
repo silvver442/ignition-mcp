@@ -15,8 +15,7 @@ def require_writes(settings: Settings, confirm: bool, action: str) -> None:
 def refuse_in_restricted_deployment(settings: Settings, action: str) -> None:
     if settings.restricted_deployment:
         raise WriteNotAllowedError(
-            f"Refusing '{action}': restricted deployment permits writes only via "
-            "perspective_deploy and perspective_restore."
+            f"Refusing '{action}': restricted deployment requires a scoped write workflow."
         )
 
 
@@ -38,6 +37,19 @@ def require_deployment_write(
 def require_tag_configuration_write(settings: Settings, confirm: bool) -> None:
     """Permit the scoped configuration workflow without enabling generic writes."""
     _require_write_confirmation(settings, confirm, "Scoped tag configuration")
+
+
+def require_project_import_scope(settings: Settings, project: str) -> None:
+    if not PROJECT_NAME.fullmatch(project):
+        raise ValidationError("Invalid project name")
+    if settings.restricted_deployment and project not in settings.project_import_allowlist:
+        raise WriteNotAllowedError("Project is not authorized by IGNITION_PROJECT_IMPORT_ALLOWLIST")
+
+
+def require_project_import_write(settings: Settings, confirm: bool, exclusive_access: bool) -> None:
+    _require_write_confirmation(settings, confirm, "Project import")
+    if exclusive_access is not True:
+        raise ValidationError("Coordinate exclusive project access before importing")
 
 
 def _require_write_confirmation(settings: Settings, confirm: bool, action: str) -> None:

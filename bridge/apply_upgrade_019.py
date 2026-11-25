@@ -12,7 +12,7 @@ from upgrade_011 import CANDIDATE, _check, _constant, _functions, _handlers, _li
 
 OLD = "0.1.8"
 NEW = "0.1.9"
-FRAGMENT = Path(__file__).with_name("src") / "cupper_tag_migrations.py"
+FRAGMENT = Path(__file__).with_name("baselines") / "cupper_tag_migrations_019.py"
 REPLACEMENTS = set(ROUTES.values()) | {"_cupper_history_proof"}
 
 

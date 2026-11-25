@@ -283,7 +283,7 @@ def test_speed_migration_uses_fresh_value_and_verifies_same_history_window(scope
     proof = {"start": 100, "end": 200, "count": 0 if case == "empty" else 2, "sha256": "a" * 64}
     current = before
     prepare_cupper_capabilities(mock_bridge)
-    mock_bridge.ping.return_value["version"] = "0.1.9"
+    mock_bridge.ping.return_value["version"] = "0.1.11"
 
     def bridge(endpoint, payload):
         nonlocal current

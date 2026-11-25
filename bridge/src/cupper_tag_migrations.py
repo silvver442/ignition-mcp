@@ -96,7 +96,7 @@ def handle_tags_scoped_cupper_migrate(payload):
             if latest != before:
                 raise ValueError('Production changed during historian verification')
             patch = {'name': name, 'dataType': 'Int4' if restoring else 'Int8', 'value': value}
-            _scoped_result(system.tag.configure(parent, json.dumps([patch]), 'm'))
+            _scoped_result(system.tag.configure(parent, [patch], 'm'))
         elif restoring:
             _cupper_require_snapshot(before, 'Int4', 'memory')
             prior = payload.get('beforeConfig')

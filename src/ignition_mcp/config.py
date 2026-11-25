@@ -22,6 +22,7 @@ class Settings:
     tag_write_allowlist: tuple[str, ...] = field(default_factory=tuple)
     write_project_allowlist: tuple[str, ...] | None = None
     tag_config_allowlist: tuple[str, ...] = ()
+    project_import_allowlist: tuple[str, ...] = ()
 
     @property
     def restricted_deployment(self) -> bool:
@@ -80,11 +81,17 @@ def load_settings(environ: dict[str, str] | None = None) -> Settings:
     if (
         _env_bool(env, "IGNITION_RESTRICTED_DEPLOYMENT", False)
         or "IGNITION_WRITE_PROJECT_ALLOWLIST" in env
+        or "IGNITION_PROJECT_IMPORT_ALLOWLIST" in env
     ):
         raw = env.get("IGNITION_WRITE_PROJECT_ALLOWLIST", "").strip()
         project_allowlist = tuple(name.strip() for name in raw.split(",")) if raw else ()
         if any(not PROJECT_NAME.fullmatch(name) for name in project_allowlist):
             problems.append("IGNITION_WRITE_PROJECT_ALLOWLIST must contain exact project names")
+
+    import_raw = env.get("IGNITION_PROJECT_IMPORT_ALLOWLIST", "").strip()
+    project_import_allowlist = tuple(name.strip() for name in import_raw.split(",")) if import_raw else ()
+    if any(not PROJECT_NAME.fullmatch(name) for name in project_import_allowlist):
+        problems.append("IGNITION_PROJECT_IMPORT_ALLOWLIST must contain exact project names")
 
     config_raw = env.get("IGNITION_TAG_CONFIG_ALLOWLIST", "").strip()
     tag_config_allowlist = tuple(path.strip() for path in config_raw.split(",")) if config_raw else ()
@@ -115,4 +122,5 @@ def load_settings(environ: dict[str, str] | None = None) -> Settings:
         tag_write_allowlist=allowlist,
         write_project_allowlist=project_allowlist,
         tag_config_allowlist=tag_config_allowlist,
+        project_import_allowlist=project_import_allowlist,
     )
