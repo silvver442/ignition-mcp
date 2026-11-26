@@ -11,7 +11,7 @@ weryfikację HMAC, wszystkie dotychczasowe trasy oraz pliki endpointu WebDev `ap
   SHA-256 szyfrogramu to
   `27a1710735e6f811b88ad9279156c403aa6848f40f990487caaa2e83d4104190`.
 - `mcp-bridge-0.1.1-1795467508565.patch` to poprawka do przeglądu, bez sekretu.
-- `bridge/upgrade_011.py` i `bridge/src/mcp_bridge_lib.py` to narzędzie i lokalny
+- `bridge/upgrade_011.py` i `bridge/baselines/mcp_bridge_lib_0_1_2.py` to narzędzie i lokalny
   wzorzec zmian. Na hoście Gateway można umieścić je w tym samym katalogu
   roboczym i jawnie przekazać `--candidate`.
 
@@ -59,7 +59,7 @@ obu znanych wersji, przejdź do procedury cofnięcia z administratorem.
        '--projects-dir', $ProjectsDir,
        '--backup', '.\mcp-bridge-0.1.0-1795467508565.zip.enc',
        '--patch', '.\mcp-bridge-0.1.1-1795467508565.patch',
-       '--candidate', '.\mcp_bridge_lib.py'
+       '--candidate', '.\mcp_bridge_lib_0_1_2.py'
    )
    py -3 @BridgeUpdate
    ```

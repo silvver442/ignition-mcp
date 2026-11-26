@@ -12,22 +12,23 @@
 
 import hashlib
 import hmac
-import json
-import math
 import os
 import codecs
 import errno
-import re
 import stat
-import threading
 
-BRIDGE_VERSION = '0.1.2'
+import math
+import re
+import threading
+import json
+BRIDGE_VERSION = '0.1.13'
 
 # Set at install time (bridge_install rewrites this constant, or edit manually).
 BRIDGE_SECRET = '__BRIDGE_SECRET__'
 
 MAX_SKEW_SECONDS = 300
 TAG_CONFIG_ROOTS = frozenset(('[default]Line_1/Cupper/Ignition',))
+TAG_CONFIG_PATHS = frozenset(('[default]Line_1/BM1/Ignition/Status', '[default]Line_1/BM1/Ignition/Speed', '[default]Line_1/BM1/Ignition/Outfeed_Counter', '[default]Line_1/BM1/Ignition/Production'))
 TAG_CONFIG_LOCK = threading.RLock()
 TAG_HISTORY_PROPERTIES = frozenset((
     'historyEnabled', 'historyProvider', 'sampleMode', 'historySampleRate',
@@ -130,7 +131,7 @@ def _compare_digest(a, b):
         return result == 0
 
 
-def _verify(envelope):
+def _verify(envelope, cupper=False):
     """Returns (payload_dict, None) on success, (None, http_response_dict) on failure."""
     def reject():
         return {'json': {'ok': False, 'code': 'auth', 'error': 'authentication failed'}}
@@ -156,12 +157,15 @@ def _verify(envelope):
         payload_bytes = payload_str.encode('utf-8')
     else:
         payload_bytes = str(payload_str)
-    message = str(ts) + '.' + payload_bytes
-    expected = hmac.new(str(BRIDGE_SECRET), message, hashlib.sha256).hexdigest()
+    message = (str(ts) + '.').encode('utf-8') + payload_bytes
+    secret_bytes = BRIDGE_SECRET.encode('utf-8') if isinstance(BRIDGE_SECRET, unicode) else BRIDGE_SECRET
+    expected = hmac.new(secret_bytes, message, hashlib.sha256).hexdigest()
     if not _compare_digest(str(expected), str(sig)):
         return None, reject()
     try:
-        payload = system.util.jsonDecode(payload_str)
+        payload = json.loads(payload_str) if cupper else system.util.jsonDecode(payload_str)
+        if cupper and not isinstance(payload, dict):
+            raise ValueError('Expected a JSON object')
     except Exception:
         return None, {'json': {'ok': False, 'error': 'payload is not valid JSON'}}
     return payload or {}, None
@@ -219,7 +223,7 @@ def _scoped_tag_path(path):
     if not isinstance(path, basestring):
         raise ValueError('path is required')
     parent, _, name = path.rpartition('/')
-    if (parent not in TAG_CONFIG_ROOTS
+    if ((parent not in TAG_CONFIG_ROOTS and path not in TAG_CONFIG_PATHS)
             or not re.match(r'^[A-Za-z_][A-Za-z0-9_]{0,254}\Z', name)
             or name.lower() in ('plc', '_types_')):
         raise ValueError('Expected a direct tag under an approved Ignition folder')
@@ -387,6 +391,7 @@ def handle_tags_scoped_restore(payload):
                 raise ValueError('Restore requires the original atomic tag configuration')
             _scoped_result(system.tag.configure(parent, [prior], 'o'))
         return _scoped_tag_snapshot(path, parent, name)
+
 
 def handle_tags_write(payload):
     writes = payload.get('writes') or []
@@ -583,6 +588,12 @@ def handle_files_read(payload):
     if not stat.S_ISREG(mode):
         return _err('not a regular file: %s' % rel)
     try:
+        if payload.get('format') == 'sha256':
+            digest = hashlib.sha256()
+            with open(full, 'rb') as f:
+                for block in iter(lambda: f.read(65536), b''):
+                    digest.update(block)
+            return {'sha256': digest.hexdigest()}
         with codecs.open(full, 'r', 'utf-8') as f:
             content = f.read()
         return {'content': content}
@@ -651,7 +662,332 @@ def handle_trial_reset(payload):
 
 # ------------------------------------------------------------------- dispatch
 
+# Jython fragment inserted into the Bridge library by apply_upgrade_013.py.
+
+def _cupper_tag_name(path):
+    root = '[default]Line_1/Cupper/Ignition/'
+    if path not in (root + 'Speed', root + 'Production'):
+        raise ValueError('Migration is limited to Cupper Speed and Production')
+    return path.rsplit('/', 1)[1]
+
+
+def _cupper_integer(value):
+    return isinstance(value, (int, long)) and not isinstance(value, bool)
+
+
+def _cupper_history_proof(start=None, end=None, name='Production'):
+    if name not in ('Production', 'Speed'):
+        raise ValueError('History proof is limited to Cupper Production and Speed')
+    window = 1800000 if name == 'Speed' else 7 * 86400000
+    cutoff = system.date.now().getTime() - 300000
+    if start is None and end is None:
+        end = cutoff
+        start = end - window
+    if (not _cupper_integer(start) or not _cupper_integer(end)
+            or not 0 <= start < end <= cutoff or end - start > window):
+        limit = '30 minutes' if name == 'Speed' else 'seven days'
+        raise ValueError('Expected a closed historical window of at most ' + limit)
+    path = 'histprov:Postgres_Historian:/drv:Ignition-Prox-Maker:default:/tag:Line_1/Cupper/Ignition/' + name
+    options = {'returnSize': -1} if name == 'Speed' else {}
+    dataset = system.historian.queryRawPoints(paths=[path], startTime=system.date.fromMillis(start),
+                                             endTime=system.date.fromMillis(end), returnFormat='TALL', **options)
+    if dataset.getColumnCount() != 4:
+        raise ValueError('Expected a timestamp, value and quality from SQL Historian')
+    rows = []
+    numeric_samples = 0
+    for index in range(dataset.getRowCount()):
+        timestamp = dataset.getValueAt(index, 3).getTime()
+        if start <= timestamp < end:
+            value = dataset.getValueAt(index, 1)
+            if value is not None and not _cupper_integer(value):
+                raise ValueError('Expected integer samples from SQL Historian')
+            if value is not None:
+                numeric_samples += 1
+            quality = dataset.getValueAt(index, 2)
+            rows.append(json.dumps([timestamp, value, str(quality)], separators=(',', ':')))
+    if rows and not numeric_samples:
+        raise ValueError('SQL Historian returned no numeric %s samples for the window' % name)
+    digest = hashlib.sha256('\n'.join(sorted(rows)).encode('utf-8')).hexdigest()
+    return {'start': start, 'end': end, 'count': len(rows), 'sha256': digest}
+
+
+def handle_tags_scoped_cupper_history(payload):
+    path = payload.get('path')
+    name = _cupper_tag_name(path)
+    if name == 'Production' and set(payload) == {'path', 'start_ms', 'end_ms'}:
+        return _cupper_raw_history(path, payload['start_ms'], payload['end_ms'])
+    if set(payload) not in ({'path'}, {'path', 'start', 'end'}) or (
+            'start' in payload and (payload['start'] is None or payload['end'] is None)):
+        raise ValueError('Expected both legacy history boundaries')
+    return _cupper_history_proof(payload.get('start'), payload.get('end'), name)
+
+
+def _cupper_same_config(first, second, fields):
+    return (dict((k, v) for k, v in first.items() if k not in fields)
+            == dict((k, v) for k, v in second.items() if k not in fields))
+
+
+def _cupper_require_snapshot(snapshot, data_type, source):
+    effective = snapshot['effective']
+    if (snapshot['config'] is None or effective.get('dataType') != data_type
+            or effective.get('valueSource') != source or effective.get('historyEnabled') is not True
+            or effective.get('historyProvider') != 'Postgres_Historian'
+            or not snapshot['valueGood'] or not _cupper_integer(snapshot['value'])):
+        raise ValueError('Unexpected Cupper type, source, history or live value')
+
+
+def handle_tags_scoped_cupper_migrate(payload):
+    name, mode = _cupper_migration_request(payload)
+    path = payload.get('path')
+    restoring = mode == 'restore'
+    with TAG_CONFIG_LOCK:
+        parent, _ = _scoped_tag_path(path)
+        before = _scoped_tag_snapshot(path, parent, name)
+        config = before['config']
+        if config != payload.get('expectedConfig'):
+            raise ValueError('Tag configuration changed before migration')
+        value = before['value']
+        if name == 'Production':
+            _cupper_require_snapshot(before, 'Int8' if restoring else 'Int4', 'memory')
+            proof = payload.get('historyProof')
+            if (not isinstance(proof, dict) or not proof.get('count')
+                    or _cupper_history_proof(proof.get('start'), proof.get('end')) != proof):
+                raise ValueError('Production raw history no longer matches its preflight')
+            if value != payload.get('expectedValue') or not -(2 ** 31) <= value < 2 ** 31:
+                raise ValueError('Production counter changed or is outside the Int4 range')
+            # Read again after the historian query and as close to configure as possible.
+            latest = _scoped_tag_snapshot(path, parent, name)
+            if latest != before:
+                raise ValueError('Production changed during historian verification')
+            patch = {'name': name, 'dataType': 'Int4' if restoring else 'Int8', 'value': value}
+            _scoped_result(system.tag.configure(parent, [patch], 'm'))
+        elif restoring:
+            _cupper_require_snapshot(before, 'Int4', 'memory')
+            prior = payload.get('beforeConfig')
+            if (value != payload.get('expectedValue') or not isinstance(prior, dict)
+                    or prior.get('valueSource') != 'expr' or prior.get('dataType', 'Int4') != 'Int4'
+                    or not isinstance(prior.get('expression'), basestring) or not prior['expression']
+                    or not _cupper_same_config(config, prior, ('valueSource', 'expression', 'value', 'defaultValue'))):
+                raise ValueError('Speed has advanced or its original expression cannot be restored safely')
+            _scoped_result(system.tag.configure(parent, [prior], 'o'))
+        else:
+            _cupper_require_snapshot(before, 'Int4', 'expr')
+            proof = payload.get('historyProof')
+            if (not isinstance(proof, dict) or not proof.get('count')
+                    or _cupper_history_proof(proof.get('start'), proof.get('end'), name) != proof):
+                raise ValueError('Speed raw history no longer matches its preflight')
+            latest = _scoped_tag_snapshot(path, parent, name)
+            _cupper_require_snapshot(latest, 'Int4', 'expr')
+            effective = latest['effective']
+            if (latest['config'] != config or effective != before['effective']
+                    or effective.get('sampleMode') != 'Periodic' or effective.get('historySampleRate') != 10
+                    or effective.get('historySampleRateUnits') != 'SEC'):
+                raise ValueError('Speed configuration or 10-second history settings changed before migration')
+            value = latest['value']
+            patch = {'name': name, 'valueSource': 'memory', 'defaultValue': value, 'value': value}
+            _scoped_result(system.tag.configure(parent, [patch], 'm'))
+        return {'valueBefore': value}
+
+
+# Jython fragment appended to the Bridge 0.1.3 library by apply_upgrade_014.py.
+
+def _cupper_migration_request(payload):
+    name = _cupper_tag_name(payload.get('path'))
+    mode = payload.get('mode')
+    if mode not in ('prepare', 'restore'):
+        raise ValueError('Expected Cupper operation prepare or restore')
+    if payload.get('exclusiveAccess') is not True:
+        raise ValueError('Explicit exclusiveAccess boolean true is required')
+    return name, mode
+
+
+def handle_tags_scoped_cupper_validate(payload):
+    name, mode = _cupper_migration_request(payload)
+    path = payload['path']
+    _scoped_tag_path(path)
+    return {'valid': True, 'path': path, 'name': name, 'mode': mode, 'exclusiveAccess': True}
+
+
+def _cupper_raw_history(path, start_ms, end_ms):
+    if (not _cupper_integer(start_ms) or not _cupper_integer(end_ms)
+            or not 0 <= start_ms < end_ms <= system.date.now().getTime()
+            or end_ms - start_ms > 7 * 86400000):
+        raise ValueError('Expected explicit start_ms and end_ms for a closed window of at most seven days')
+    history_path = ('histprov:Postgres_Historian:/drv:Ignition-Prox-Maker:default:'
+                    '/tag:Line_1/Cupper/Ignition/Production')
+    dataset = system.historian.queryRawPoints(
+        paths=[history_path], startTime=system.date.fromMillis(start_ms),
+        endTime=system.date.fromMillis(end_ms), returnFormat='TALL', returnSize=-1,
+    )
+    if dataset.getColumnCount() != 4:
+        raise ValueError('Expected path, value, quality and timestamp in the TALL historian dataset')
+    rows = []
+    for index in range(dataset.getRowCount()):
+        timestamp_ms = dataset.getValueAt(index, 3).getTime()
+        if start_ms <= timestamp_ms <= end_ms:
+            value = dataset.getValueAt(index, 1)
+            if value is not None and not _cupper_integer(value):
+                raise ValueError('Expected integer samples from SQL Historian')
+            quality = dataset.getValueAt(index, 2)
+            sample = {'timestamp_ms': timestamp_ms, 'value': value, 'path': path,
+                      'quality': None if quality is None else unicode(quality)}
+            encoded = json.dumps(sample, sort_keys=True, ensure_ascii=True, separators=(',', ':'))
+            rows.append((timestamp_ms, encoded, sample))
+    rows.sort(key=lambda row: row[:2])
+    digest = hashlib.sha256('\n'.join(row[1] for row in rows).encode('ascii')).hexdigest()
+    return {'path': path, 'start_ms': start_ms, 'end_ms': end_ms, 'count': len(rows),
+            'sha256': digest, 'samples': [row[2] for row in rows]}
+
+
+# Additive Jython fragment for the dedicated Cupper source migration probe.
+
+
+def _source_test_expression(snapshot):
+    config = snapshot['config']
+    effective = snapshot['effective']
+    value = snapshot['value']
+    return (config is not None and config.get('expression') == 'getsecond(now())'
+            and effective.get('valueSource', config.get('valueSource')) == 'expr'
+            and effective.get('dataType', config.get('dataType')) == 'Int4'
+            and effective.get('historyEnabled', config.get('historyEnabled')) is False
+            and snapshot['valueGood'] and isinstance(value, (int, long))
+            and not isinstance(value, bool) and 0 <= value < 60)
+
+
+def _source_test_quality(results, value):
+    if results is None:
+        return {'count': None, 'qualities': [], 'valueBefore': value}
+    count = len(results)
+    qualities = []
+    for index in range(count):
+        quality = results[index]
+        qualities.append(None if quality is None else {
+            'name': unicode(quality.getName()), 'code': int(quality.getCode()), 'good': bool(quality.isGood()),
+        })
+    return {'count': count, 'qualities': qualities, 'valueBefore': value}
+
+
+def _source_test_create_result(results):
+    result = _source_test_quality(results, None)
+    if result['count'] != 1 or result['qualities'][0] is None or result['qualities'][0]['good']:
+        return result
+    try:
+        message = results[0].getDiagnosticMessage()
+        if not message:
+            return result
+        message = unicode(message)[:1024].lower().strip()
+    except Exception:
+        return result
+    if not message:
+        return result
+
+    # Return only a fixed identifier. Ignition messages can embed sensitive input.
+    reasons = (
+        ('name_collision', ('already exists', 'duplicate tag', 'name collision')),
+        ('invalid_path', ('invalid path', 'invalid tag path', 'parent folder does not exist')),
+        ('invalid_expression', ('invalid expression', 'expression syntax', 'could not parse expression')),
+        ('invalid_data_type', ('invalid data type', 'unsupported data type', 'unknown data type')),
+        ('invalid_tag_group', ('invalid tag group', 'unknown tag group', 'tag group does not exist')),
+        ('invalid_json', ('invalid json', 'malformed json', 'could not parse json')),
+        ('permission_denied', ('permission denied', 'access denied', 'not authorized')),
+    )
+    result['diagnostic'] = 'redacted'
+    for reason, phrases in reasons:
+        if any(phrase in message for phrase in phrases):
+            result['diagnostic'] = reason
+            break
+    return result
+
+
+def handle_tags_scoped_cupper_source_test(payload):
+    path = '[default]Line_1/Cupper/Ignition/MCP_Test_SourceMigration'
+    if (set(payload) != {'path', 'action', 'expectedConfig', 'exclusiveAccess'}
+            or payload['path'] != path or payload['exclusiveAccess'] is not True
+            or payload['action'] not in ('create', 'merge', 'overwrite', 'undo_create')):
+        raise ValueError('An exact source test operation and exclusive access are required')
+    action = payload['action']
+    with TAG_CONFIG_LOCK:
+        parent, name = _scoped_tag_path(path)
+        before = _scoped_tag_snapshot(path, parent, name)
+        config = before['config']
+        if config != payload['expectedConfig']:
+            raise ValueError('Test tag configuration changed before the write')
+        if action == 'create':
+            if config is not None:
+                raise ValueError('Test tag already exists')
+            definition = {'name': name, 'tagType': 'AtomicTag', 'dataType': 'Int4',
+                          'valueSource': 'expr', 'expression': 'getsecond(now())', 'historyEnabled': False}
+            return _source_test_create_result(system.tag.configure(parent, [definition], 'a'))
+        if not _source_test_expression(before):
+            raise ValueError('The probe requires the reviewed Expression test tag with good quality')
+        if action == 'undo_create':
+            _scoped_result(system.tag.deleteTags([path]))
+            return {'deleted': True}
+        value = before['value']
+        # Use the exact definition and collision policy of the existing Speed migration.
+        patch = {'name': name, 'valueSource': 'memory', 'defaultValue': value, 'value': value}
+        if action == 'merge':
+            return _source_test_quality(system.tag.configure(parent, [patch], 'm'), value)
+        definition = dict(config)
+        del definition['expression']
+        definition.update(patch)
+        return _source_test_quality(system.tag.configure(parent, [definition], 'o'), value)
+
+
+# Map exact tag paths to qualified historian paths reviewed by the Gateway operator.
+# SQL Historian uses the drv syntax, while Core Historian uses sys/prov.
+RAW_HISTORY_PATHS = {
+    '[default]Line_1/Cupper/Ignition/Speed': 'histprov:Postgres_Historian:/drv:Ignition-Prox-Maker:default:/tag:Line_1/Cupper/Ignition/Speed',
+    '[default]Line_1/BM1/Ignition/Speed': 'histprov:Postgres_Historian:/drv:Ignition-Prox-Maker:default:/tag:Line_1/BM1/Ignition/Speed',
+    '[default]Line_1/BM1/Ignition/Production': 'histprov:Postgres_Historian:/drv:Ignition-Prox-Maker:default:/tag:Line_1/BM1/Ignition/Production',
+}
+
+
+def handle_history_raw(payload):
+    if set(payload) != {'path', 'start_ms', 'end_ms'}:
+        raise ValueError('Expected path, start_ms and end_ms')
+    path = payload['path']
+    if not isinstance(path, basestring) or path not in RAW_HISTORY_PATHS:
+        raise ValueError('Tag path is not allowed for raw history')
+    start = payload['start_ms']
+    end = payload['end_ms']
+    if (any(not isinstance(value, (int, long)) or isinstance(value, bool) for value in (start, end))
+            or not 0 <= start <= end < system.date.now().getTime()
+            or end - start > 7 * 86400000):
+        raise ValueError('Expected an inclusive historical Unix millisecond window of at most seven days')
+
+    # Keep the requested endpoints inside the query and discard any outside rows.
+    dataset = system.historian.queryRawPoints(
+        paths=[RAW_HISTORY_PATHS[path]], startTime=system.date.fromMillis(start - 1),
+        endTime=system.date.fromMillis(end + 1), returnFormat='TALL', returnSize=-1,
+        includeBounds=False,
+    )
+    if dataset.getColumnCount() != 4:
+        raise ValueError('Expected path, value, quality and timestamp from the Historian')
+    samples = []
+    for index in range(dataset.getRowCount()):
+        timestamp = dataset.getValueAt(index, 3).getTime()
+        if not start <= timestamp <= end:
+            continue
+        value = dataset.getValueAt(index, 1)
+        if (value is not None and not isinstance(value, (bool, int, long, float, basestring))
+                or isinstance(value, float) and (math.isnan(value) or math.isinf(value))):
+            raise ValueError('Historian returned a value that cannot be represented in JSON')
+        quality = dataset.getValueAt(index, 2)
+        if quality is None:
+            raise ValueError('Historian returned a sample without quality')
+        if len(samples) == 10000:
+            raise ValueError('Raw history exceeds 10000 samples. Request a shorter window.')
+        samples.append({'path': path, 'timestamp_ms': timestamp,
+                        'value': value, 'quality': unicode(quality)})
+    return {'path': path, 'start_ms': start, 'end_ms': end, 'count': len(samples), 'samples': samples}
+
+
 HANDLERS = {
+    'history/raw': handle_history_raw,
+    'tags/scoped-cupper-source-test': handle_tags_scoped_cupper_source_test,
+    'tags/scoped-cupper-history': handle_tags_scoped_cupper_history,
+    'tags/scoped-cupper-migrate': handle_tags_scoped_cupper_migrate,
     'ping': handle_ping,
     'tags/browse': handle_tags_browse,
     'tags/read': handle_tags_read,
@@ -672,6 +1008,7 @@ HANDLERS = {
     'files/write': handle_files_write,
     'files/delete': handle_files_delete,
     'trial/reset': handle_trial_reset,
+    'tags/scoped-cupper-validate': handle_tags_scoped_cupper_validate,
 }
 
 
@@ -682,7 +1019,7 @@ def handle(request):
         return {'json': {'ok': False, 'error': 'unknown endpoint: %s' % endpoint,
                          'remediation': 'Known endpoints: %s' % ', '.join(sorted(HANDLERS))}}
 
-    payload, reject_response = _verify(request.get('data'))
+    payload, reject_response = _verify(request.get('data'), endpoint.startswith('tags/scoped-cupper-') or endpoint == 'history/raw')
     if reject_response is not None:
         return reject_response
 

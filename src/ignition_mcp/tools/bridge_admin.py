@@ -5,33 +5,58 @@ from __future__ import annotations
 import ast
 import hashlib
 import io
+import json
 import re
 import zipfile
 from pathlib import Path
 from typing import Any
 
+import httpx
 from mcp.server.fastmcp import FastMCP
 
 from ..app import AppContext, tool_result
 from ..bridge import MIN_BRIDGE_VERSION
-from ..errors import BridgeUnavailableError, GatewayError, IgnitionMcpError, ValidationError
+from ..errors import (
+    AuthError,
+    BridgeUnavailableError,
+    GatewayError,
+    IgnitionMcpError,
+    NotFoundError,
+    PermissionDeniedError,
+    ValidationError,
+)
 from ..guards import require_writes
 
 SECRET_PLACEHOLDER = "__BRIDGE_SECRET__"
 LIB_ARCNAME = "ignition/script-python/mcp_bridge_lib/code.py"
-BRIDGE_PROJECT_LIBRARY = f"mcp-bridge/{LIB_ARCNAME}"
+PROJECT = "mcp-bridge"
+BRIDGE_PROJECT_LIBRARY = f"{PROJECT}/{LIB_ARCNAME}"
+LIB_MANIFEST = LIB_ARCNAME.rsplit("/", 1)[0] + "/resource.json"
+WEBDEV = "com.inductiveautomation.webdev/resources/api"
+BRIDGE_FILES = {
+    "project.json",
+    LIB_ARCNAME,
+    LIB_MANIFEST,
+    f"{WEBDEV}/config.json",
+    f"{WEBDEV}/doPost",
+    f"{WEBDEV}/resource.json",
+}
 LOCAL_LIBRARY = Path(__file__).resolve().parents[3] / "bridge" / "src" / "mcp_bridge_lib.py"
 
 
-def _scoped_result_fingerprint(source: str) -> tuple[str, str]:
-    tree = ast.parse(source)
+def _bridge_version(tree: ast.Module) -> str:
     version, = (ast.literal_eval(node.value) for node in tree.body if isinstance(node, ast.Assign)
                 and any(isinstance(target, ast.Name) and target.id == "BRIDGE_VERSION"
                         for target in node.targets))
     if not isinstance(version, str) or not re.fullmatch(r"[0-9]{1,5}(?:\.[0-9]{1,5}){2}", version):
         raise ValueError("Invalid Bridge version")
+    return version
+
+
+def _scoped_result_fingerprint(source: str) -> tuple[str, str]:
+    tree = ast.parse(source)
     result, = (node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_scoped_result")
-    return version, hashlib.sha256(ast.dump(result).encode()).hexdigest()
+    return _bridge_version(tree), hashlib.sha256(ast.dump(result).encode()).hexdigest()
 
 # Matches only the `BRIDGE_SECRET = '__BRIDGE_SECRET__'` assignment line, not the
 # gateway-side "is this configured?" guard that also references the placeholder
@@ -58,29 +83,57 @@ def _find_bridge_zip() -> Path:
 BRIDGE_ZIP = _find_bridge_zip()
 
 
-def _zip_with_secret(secret: str) -> bytes:
-    """Return the bridge zip with the secret substituted into the script library."""
-    if not BRIDGE_ZIP.is_file():
+def _zip_with_secret(secret: str) -> tuple[bytes, str, str]:
+    """Prepare the in-memory install ZIP, its version and its exact library digest."""
+    try:
+        with zipfile.ZipFile(BRIDGE_ZIP) as src:
+            names = src.namelist()
+            if len(names) != len(BRIDGE_FILES) or set(names) != BRIDGE_FILES:
+                raise ValueError("Unexpected Bridge archive entries")
+            files = {name: src.read(name) for name in names}
+        project = json.loads(files["project.json"])
+        if (
+            project.get("name", PROJECT) != PROJECT
+            or project.get("enabled") is not True
+            or project.get("parent") not in ("", None)
+            or project.get("inheritable") is not False
+        ):
+            raise ValueError("Invalid Bridge project metadata")
+        for path, expected in (
+            (LIB_MANIFEST, ["code.py"]),
+            (f"{WEBDEV}/resource.json", ["config.json", "doPost"]),
+        ):
+            manifest = json.loads(files[path])
+            if manifest.get("scope") != "G" or manifest.get("files") != expected:
+                raise ValueError("Invalid Bridge resource manifest")
+        webdev = json.loads(files[f"{WEBDEV}/config.json"])
+        if (
+            webdev.get("resource-type") != "python-resource"
+            or webdev.get("doPost", {}).get("enabled") is not True
+        ):
+            raise ValueError("The WebDev endpoint is inactive")
+        if not any(
+            isinstance(node, ast.FunctionDef) and node.name == "doPost"
+            for node in ast.parse(files[f"{WEBDEV}/doPost"]).body
+        ):
+            raise ValueError("The WebDev handler is absent")
+        text = files[LIB_ARCNAME].decode("utf-8")
+        match, = _ASSIGNMENT_RE.finditer(text)
+        version = _bridge_version(ast.parse(text))
+    except (OSError, ValueError, AttributeError, SyntaxError, RuntimeError, zipfile.BadZipFile):
         raise BridgeUnavailableError(
-            f"Bridge archive not found at {BRIDGE_ZIP}. Run `python bridge/build_zip.py` first."
-        )
-    src = zipfile.ZipFile(BRIDGE_ZIP)
+            "Bridge archive is missing or invalid. Run `python bridge/build_zip.py` first."
+        ) from None
+
+    start, end = match.span()
+    literal = ascii(secret) if secret.isascii() else "u" + ascii(secret)
+    library = (text[:start] + f"BRIDGE_SECRET = {literal}" + text[end:]).encode("utf-8")
+    files[LIB_ARCNAME] = library
     out_buf = io.BytesIO()
     with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as dst:
-        for info in src.infolist():
-            data = src.read(info.filename)
-            if info.filename == LIB_ARCNAME:
-                text = data.decode("utf-8")
-                match = _ASSIGNMENT_RE.search(text)
-                if not match:
-                    raise BridgeUnavailableError(
-                        "Bridge archive is missing the secret placeholder; rebuild it."
-                    )
-                start, end = match.span()
-                text = text[:start] + f"BRIDGE_SECRET = {secret!r}" + text[end:]
-                data = text.encode("utf-8")
-            dst.writestr(info, data)
-    return out_buf.getvalue()
+        for name, data in files.items():
+            dst.writestr(name, data)
+    return out_buf.getvalue(), version, hashlib.sha256(library).hexdigest()
 
 
 def register(mcp: FastMCP, ctx: AppContext) -> None:
@@ -102,33 +155,68 @@ def register(mcp: FastMCP, ctx: AppContext) -> None:
     @mcp.tool()
     @tool_result(ctx)
     def bridge_install(confirm: bool = False) -> dict[str, Any]:
-        """Install/upgrade the mcp-bridge WebDev project on the gateway. Mutating, REST plane.
+        """Create the mcp-bridge WebDev project only if it is absent. Mutating, REST plane.
 
         Uses IGNITION_BRIDGE_SECRET as the shared HMAC secret. After import, verifies
-        the bridge responds to a signed ping."""
+        the running version and library digest through signed Bridge calls."""
         require_writes(ctx.settings, confirm, "bridge_install")
-        if not ctx.settings.bridge_secret:
+        secret = ctx.settings.bridge_secret
+        if not secret or secret == SECRET_PLACEHOLDER:
             raise ValidationError(
                 "IGNITION_BRIDGE_SECRET must be set before installing the bridge.",
                 remediation="Generate a random secret and set IGNITION_BRIDGE_SECRET, then retry.",
             )
-        payload = _zip_with_secret(ctx.settings.bridge_secret)
-        ctx.client.post_bytes(
-            "projects/import/mcp-bridge",
-            payload,
-            "application/zip",
-            params={"overwrite": "true"},
-        )
-        ctx.client.scan_projects()
         try:
-            pong = ctx.bridge.ping()
-        except BridgeUnavailableError as exc:
+            ctx.client.get_json(f"projects/find/{PROJECT}")
+        except NotFoundError:
+            pass
+        else:
+            raise ValidationError(
+                "The mcp-bridge project already exists.",
+                remediation="Use bridge_status to verify it or follow the version-specific upgrade.",
+            )
+
+        payload, version, digest = _zip_with_secret(secret)
+        recovery = (
+            "Check project_get for mcp-bridge and bridge_status before retrying. See docs/bridge.md."
+        )
+        try:
+            ctx.client.post_bytes(
+                f"projects/import/{PROJECT}",
+                payload,
+                "application/zip",
+                params={"overwrite": "false"},
+            )
+        except (AuthError, PermissionDeniedError):
+            raise
+        except (IgnitionMcpError, httpx.TransportError):
             return {
+                "status": "uncertain",
+                "phase": "import",
+                "installed": None,
+                "verified": False,
+                "bridge_version": version,
+                "note": recovery,
+            }
+
+        try:
+            if ctx.bridge.ping().get("version") != version:
+                raise GatewayError("Running Bridge version differs from the archive")
+            readback = ctx.bridge.call(
+                "files/read", {"path": BRIDGE_PROJECT_LIBRARY, "format": "sha256"},
+            )
+            if readback != {"sha256": digest}:
+                raise GatewayError("Bridge library digest differs from the imported library")
+        except (IgnitionMcpError, httpx.TransportError):
+            return {
+                "status": "uncertain",
+                "phase": "verification",
                 "installed": True,
                 "verified": False,
-                "note": str(exc),
+                "bridge_version": version,
+                "note": recovery,
             }
-        return {"installed": True, "verified": True, "bridge_version": pong.get("version")}
+        return {"status": "success", "installed": True, "verified": True, "bridge_version": version}
 
     @mcp.tool()
     @tool_result(ctx)

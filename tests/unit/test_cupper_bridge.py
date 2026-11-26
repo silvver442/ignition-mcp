@@ -32,7 +32,7 @@ def date(ms):
 
 
 def bridge_versions():
-    candidate = (BRIDGE / "src" / "mcp_bridge_lib.py").read_bytes()
+    candidate = upgrade.CANDIDATE.read_bytes()
     source, tree, _, _ = diagnostic._library(candidate)
     scoped_result = diagnostic._functions(tree)["_scoped_result"]
     baseline = candidate.replace(upgrade.excerpt(source, scoped_result).encode(),
@@ -45,7 +45,7 @@ def bridge_versions():
 class CupperUpgradeTests(unittest.TestCase):
     def test_014_keeps_the_live_secret_and_supports_a_verified_redacted_backup(self):
         secret = "synthetic-secret-long-enough-for-local-tests"
-        source = (BRIDGE / "src" / "mcp_bridge_lib.py").read_bytes()
+        source = upgrade.CANDIDATE.read_bytes()
         live = upgrade.rebind_secret(install.prepare(source, install.FRAGMENT.read_bytes()), secret)
         prepared = fixed.prepare(live, fixed.FRAGMENT.read_bytes())
         self.assertEqual(fixed._library(prepared)[3], secret)

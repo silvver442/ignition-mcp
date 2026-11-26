@@ -72,7 +72,7 @@ Claude Desktop (`claude_desktop_config.json`) or Claude Code (`.mcp.json`):
 Restart the client and ask it to run `ignition_diagnose`. You should get an all-green checklist,
 aside from a warning about the bridge, which is the next step.
 
-### 4. Install the bridge (recommended, needed for live data and Perspective deploys)
+### 4. Install Bridge 0.1.13
 
 Generate a random secret, enable writes, and let the server install the bridge for you:
 
@@ -85,9 +85,10 @@ Generate a random secret, enable writes, and let the server install the bridge f
 }
 ```
 
-Ask your assistant to install the bridge (this runs the `bridge_install` tool), then run
-`ignition_diagnose` again to confirm the bridge check is green. See
-[docs/bridge.md](docs/bridge.md) for the manual install path and troubleshooting.
+For a new Gateway project, run `bridge_install(confirm=true)`. The bundled archive
+installs the complete Bridge 0.1.13. After installation, run `bridge_status` and confirm
+`version=0.1.13`. For an existing bridge, check its version first and follow the
+[version-specific upgrade and recovery instructions](docs/bridge.md).
 
 ## Configuration
 

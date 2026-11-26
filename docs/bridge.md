@@ -11,9 +11,10 @@ A single Ignition project (`mcp-bridge`) containing:
 - a project script library, `mcp_bridge_lib`, holding all the logic and security checks
 - one WebDev python resource, `api`, whose `doPost` is a one-liner that delegates to the library
 
-It's mounted at `POST /system/webdev/mcp-bridge/api/<endpoint>` and distributed as
-`bridge/mcp-bridge.zip` (rebuild it with `python bridge/build_zip.py`). The readable sources live
-in `bridge/src/`.
+It is mounted at `POST /system/webdev/mcp-bridge/api/<endpoint>`. The library and its
+`BRIDGE_VERSION` are in `bridge/src/mcp_bridge_lib.py`. Run `python bridge/build_zip.py`
+to regenerate the bundled `bridge/mcp-bridge.zip` and `python bridge/build_zip.py --check`
+to check it against the current sources. Historical upgrade inputs live in `bridge/baselines/`.
 
 ## Security
 
@@ -27,40 +28,44 @@ Every request carries a signed envelope produced by the MCP server:
 
 The bridge rejects requests whose timestamp skews more than 300 seconds, verifies the HMAC with
 a constant-time compare, and returns a generic `{"ok": false, "code": "auth"}` on any failure
-with no further detail. File operations are jailed to `data/projects/`: path traversal via `..`,
-absolute paths, or symlink escapes is rejected before any I/O happens.
+with no further detail. File operations require a relative path whose normalized
+absolute location stays within `data/projects/`.
 
 The shared secret is `IGNITION_BRIDGE_SECRET` on the MCP side and a constant in the
 `mcp_bridge_lib` script on the gateway side. They have to match. Never commit the real secret;
 the archive ships with a `__BRIDGE_SECRET__` placeholder that gets substituted at install time.
 
-## Automatic install (recommended)
+## New installation of Bridge 0.1.13
 
-For an existing 0.1.0 bridge on the test gateway, follow the
-[single-library upgrade](bridge-upgrade-011.md).
+Set `IGNITION_BRIDGE_SECRET` using the MCP client's secret mechanism and enable
+`IGNITION_ALLOW_WRITES`. Run `bridge_install(confirm=true)` on a Gateway where
+`mcp-bridge` is absent. The installer substitutes the secret in memory and sends
+one project import with `overwrite=false`. It verifies the running version with a
+signed ping and checks the SHA-256 of the imported library with a signed file read.
 
-With `IGNITION_ALLOW_WRITES=true` and `IGNITION_BRIDGE_SECRET` set, ask your assistant to run the
-`bridge_install` tool. It substitutes your secret into a copy of the archive, imports it as
-project `mcp-bridge` via the REST API, triggers a project scan, and verifies the result with a
-signed ping. Then run `ignition_diagnose`; the bridge check should come back green.
+### Manual install
 
-## Manual install
+1. Verify the bundled archive with `python bridge/build_zip.py --check`.
+2. Import `bridge/mcp-bridge.zip` as a new `mcp-bridge` project without overwrite.
+3. In Designer, replace the placeholder in the `BRIDGE_SECRET` assignment in the
+   `mcp_bridge_lib` project library and save. Set the same value using your MCP
+   client's secret mechanism. Keep the repository copy with its placeholder.
 
-1. Build the archive with your secret baked in:
-   ```bash
-   python bridge/build_zip.py
-   # then substitute the secret in the extracted mcp_bridge_lib/code.py, or edit it after import
-   ```
-2. In the Ignition Designer or gateway, import `bridge/mcp-bridge.zip` as a new project.
-3. Open the `mcp_bridge_lib` script and set `BRIDGE_SECRET = '<your secret>'`, replacing the
-   `__BRIDGE_SECRET__` placeholder, then save.
-4. Confirm the endpoint responds:
-   ```bash
-   curl -s -X POST -H 'Content-Type: application/json' -d '{}' \
-     http://localhost:8088/system/webdev/mcp-bridge/api/ping
-   # -> {"ok": false, "code": "auth", ...}   (correct: unsigned requests are rejected)
-   ```
-5. Set the same value as `IGNITION_BRIDGE_SECRET` in your MCP client config.
+## Check the running version
+
+Run the read-only `bridge_status` tool and look for `version: "0.1.13"` and the
+`files/read` capability. Run `ignition_diagnose` to investigate connectivity or
+authentication failures.
+
+## Upgrade an existing installation
+
+Check the running version first. For the configured Ignition 8.3.9 test Gateway
+running Bridge 0.1.12, use `python bridge/apply_upgrade_0113.py --apply` with the
+existing authenticated launcher. The updater verifies its starting version,
+creates and verifies a redacted backup, changes only the library, and confirms
+0.1.13 and the signed raw SHA-256 readback. Earlier versions require the
+version-specific upgrade path. The [0.1.1 upgrade](bridge-upgrade-011.md)
+documents a historical step.
 
 ## Endpoints
 
@@ -71,20 +76,20 @@ All are `POST` and all require the signed envelope described above.
 | `ping` | version and capability list |
 | `tags/browse`, `tags/read`, `tags/write`, `tags/configure` | tag operations |
 | `tags/scoped-state`, `tags/scoped-configure`, `tags/scoped-restore` | verified configuration of individual test tags |
-| `history/query`, `history/providers` | tag history |
+| `history/query`, `history/providers`, `history/raw` | tag history, including raw history for approved paths |
 | `alarms/status`, `alarms/journal`, `alarms/ack` | alarms |
 | `db/named-query`, `db/query` | database access |
-| `files/list`, `files/read`, `files/write`, `files/delete` | project files, jailed to `data/projects/` |
+| `files/list`, `files/read`, `files/write`, `files/delete` | project files under `data/projects/`, including UTF-8 reads and optional raw SHA-256 reads |
 | `trial/reset` | reset the gateway trial timer, for development gateways running under a trial license |
 
 ## Scoped test tag configuration
 
 The restricted MCP profile uses `IGNITION_TAG_CONFIG_ALLOWLIST` independently of
 the Perspective project allowlist and the legacy tag-value write allowlist. On
-the test launcher it contains `[default]Line_1/Cupper/Ignition`. Bridge 0.1.1
-enforces the same initial scope and checks that every ancestor is an existing
-ordinary folder. The scoped tools accept individual atomic tags directly in the
-folder.
+the test launcher it contains `[default]Line_1/Cupper/Ignition`. Bridge 0.1.13
+allows that Cupper folder and four exact BM1 paths. The server's configured
+allowlist also applies. The Bridge checks that every ancestor is an existing
+ordinary folder and that the target is an individual atomic tag.
 
 - `tag_config_get` returns the tag configuration, effective properties, and a
   state fingerprint. Use it for `Status`, `Speed` and `Production` before making
@@ -107,28 +112,17 @@ bridge.
 
 ## Troubleshooting
 
-**`bridge_install` reports `verified: false`, or `bridge_status` claims the secret doesn't match
-right after a fresh install.**
+**`bridge_install` reports `status: "uncertain"`.** Check `project_get` for
+`mcp-bridge` and run `bridge_status`. If the project is absent, retry the install.
+If the project exists, confirm that WebDev is active and that the Gateway and MCP
+use the same secret. Inspect the library and WebDev resource in Designer. A
+project export can contain the configured secret. Keep any export in protected
+storage outside the repository.
 
-This points to a platform quirk observed on 8.3 early-access builds: after
-`POST /data/api/v1/projects/import/{name}`, the gateway's served project files are correct
-(confirmed via `project_export`), but the already-loaded Jython script module for
-`mcp_bridge_lib` doesn't hot-reload, and neither does a full gateway restart. A raw filesystem
-write to the resource, followed by a project scan, does force a reload reliably. If you have
-filesystem access to the gateway:
-
-```bash
-# Replace the placeholder (or old secret) directly in the deployed file:
-sed -i '' "s/BRIDGE_SECRET = '.*'/BRIDGE_SECRET = 'YOUR_SECRET'/" \
-  /path/to/ignition/data/projects/mcp-bridge/ignition/script-python/mcp_bridge_lib/code.py
-
-curl -X POST http://GATEWAY:8088/data/api/v1/scan/projects \
-  -H "X-Ignition-API-Token: name:secret"
-```
-
-Wait a few seconds, then re-run `bridge_status`. Without filesystem access to a remote gateway,
-open the project in Designer, open the `mcp_bridge_lib` script, and save it even with no changes.
-Designer saves go through a different code path that does trigger the reload.
+If the confirmed new project is incomplete, an operator can remove that project
+after saving a protected copy, then retry the create-only install. For a project
+that existed before the attempt, follow the version-specific upgrade or restore
+procedure.
 
 **403 on everything.** See the API-key permission fix in the README: the key's auto-created
 security level needs to be added to both Gateway Read and Write Permissions.

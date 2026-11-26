@@ -5,11 +5,12 @@ containing the mcp-bridge WebDev endpoint and its script library.
 The BRIDGE_SECRET placeholder stays intact; it is substituted at install time
 (bridge_install tool) or by the operator during a manual import.
 
-Usage: python bridge/build_zip.py
+Usage: python bridge/build_zip.py [--check]
 """
 
 from __future__ import annotations
 
+import argparse
 import io
 import json
 import zipfile
@@ -18,8 +19,6 @@ from pathlib import Path
 HERE = Path(__file__).parent
 SRC = HERE / "src"
 OUT = HERE / "mcp-bridge.zip"
-PERSPECTIVE = "com.inductiveautomation.perspective"
-
 # Fixed timestamp for reproducible archives.
 ZINFO_DATE = (2026, 1, 1, 0, 0, 0)
 
@@ -31,8 +30,8 @@ def _write(zf: zipfile.ZipFile, arcname: str, data: str) -> None:
 
 
 def build() -> bytes:
-    lib_code = (SRC / "mcp_bridge_lib.py").read_text()
-    endpoint_code = (SRC / "doPost.py").read_text()
+    lib_code = (SRC / "mcp_bridge_lib.py").read_text(encoding="utf-8")
+    endpoint_code = (SRC / "doPost.py").read_text(encoding="utf-8")
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
@@ -68,7 +67,23 @@ def build() -> bytes:
 
 
 def main() -> None:
-    OUT.write_bytes(build())
+    parser = argparse.ArgumentParser(description="Build the mcp-bridge project archive")
+    parser.add_argument(
+        "--check", action="store_true", help="check the tracked archive against current sources",
+    )
+    args = parser.parse_args()
+    built = build()
+    if args.check:
+        try:
+            with zipfile.ZipFile(OUT) as current, zipfile.ZipFile(io.BytesIO(built)) as expected:
+                if sorted(current.namelist()) == sorted(expected.namelist()) and all(
+                    current.read(name) == expected.read(name) for name in expected.namelist()
+                ):
+                    return
+        except (OSError, zipfile.BadZipFile):
+            pass
+        parser.exit(1, "Bridge archive differs from its sources. Run python bridge/build_zip.py.\n")
+    OUT.write_bytes(built)
     print(f"wrote {OUT} ({OUT.stat().st_size} bytes)")
 
 

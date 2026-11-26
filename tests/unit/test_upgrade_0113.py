@@ -1,5 +1,6 @@
 """Exercise the 0.1.13 file-read handler and upgrade with real local file bytes."""
 
+import ast
 import sys
 import unittest
 from base64 import b64decode
@@ -13,8 +14,8 @@ from .test_upgrade_012 import SECRET, project_zip
 BRIDGE = Path(__file__).resolve().parents[2] / "bridge"
 with patch.object(sys, "path", [str(BRIDGE), *sys.path]):
     import apply_upgrade_0113 as release
-    from apply_upgrade_012 import backup_library, rebind_secret, sha, upgrade
-    from upgrade_011 import CANDIDATE, UpgradeError
+    from apply_upgrade_012 import backup_library, excerpt, rebind_secret, sha, upgrade
+    from upgrade_011 import CANDIDATE, UpgradeError, _functions
 
 PNG = b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aG2cAAAAASUVORK5CYII="
@@ -74,6 +75,16 @@ class BinaryReadUpgradeTests(unittest.TestCase):
                             self.candidate)
         with self.assertRaises(UpgradeError):
             release.prepare(self.before, self.candidate.replace(b"return {'content': content}", b"return {}"))
+
+    def test_upgrade_of_complete_library_matches_fresh_install_source(self):
+        current = (BRIDGE / "src/mcp_bridge_lib.py").read_bytes()
+        historical = CANDIDATE.read_text(encoding="utf-8")
+        text_handler = excerpt(historical, _functions(ast.parse(historical))[release.HANDLER]).encode()
+        self.assertEqual(current.count(self.candidate.strip()), 1)
+        before = current.replace(self.candidate.strip(), text_handler, 1).replace(
+            b"BRIDGE_VERSION = '0.1.13'", b"BRIDGE_VERSION = '0.1.12'", 1,
+        )
+        self.assertEqual(release.prepare(before, self.candidate), current)
 
     def run_upgrade(self, *, bad_digest=False, fail_backup=False):
         library = self.root / release.GATEWAY_LIBRARY

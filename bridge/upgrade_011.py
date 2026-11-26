@@ -22,7 +22,7 @@ from zipfile import BadZipFile, ZipFile
 
 LIBRARY = "ignition/script-python/mcp_bridge_lib/code.py"
 WEBDEV = "com.inductiveautomation.webdev/resources/api"
-CANDIDATE = Path(__file__).with_name("src") / "mcp_bridge_lib.py"
+CANDIDATE = Path(__file__).with_name("baselines") / "mcp_bridge_lib_0_1_2.py"
 PLACEHOLDER = "__BRIDGE_SECRET__"
 HEADER = b"IGNITION-MCP-BRIDGE-BACKUP-v1\x00"
 SCOPED = ("tags/scoped-state", "tags/scoped-configure", "tags/scoped-restore")
