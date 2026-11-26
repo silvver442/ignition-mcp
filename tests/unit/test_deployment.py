@@ -2,7 +2,9 @@
 
 import io
 import json
+from base64 import b64decode
 from dataclasses import replace
+from hashlib import sha256
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -18,6 +20,10 @@ VIEW_DIR = f"{PREFIX}/views/Area/Existing"
 NEW_DIR = f"{PREFIX}/views/New"
 CONFIG = f"{deployment.PAGE_CONFIG}/config.json"
 VIEW = {"root": {"type": "ia.container.flex", "meta": {"name": "root"}}}
+PNG = b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aG2cAAAAASUVORK5CYII="
+)
+CHANGED_PNG = PNG[:-1] + bytes([PNG[-1] ^ 1])
 
 
 def encode(value):
@@ -34,7 +40,7 @@ def gateway(tmp_path, app_ctx, mock_client, mock_bridge, make_tools, monkeypatch
         f"{VIEW_DIR}/resource.json": encode(
             {"files": ["view.json", "thumbnail.png"], "attributes": {"custom": True}}
         ),
-        f"{VIEW_DIR}/thumbnail.png": b"\x89PNG",
+        f"{VIEW_DIR}/thumbnail.png": PNG,
         CONFIG: encode(
             {
                 "pages": {"/": {"viewPath": "Area/Existing", "docks": {"left": []}}},
@@ -63,7 +69,12 @@ def gateway(tmp_path, app_ctx, mock_client, mock_bridge, make_tools, monkeypatch
         if endpoint == "files/read":
             if path not in files:
                 raise NotFoundError("missing")
-            return {"content": files[path].decode()}
+            if payload.get("format") == "sha256":
+                return {"sha256": sha256(files[path]).hexdigest()}
+            try:
+                return {"content": files[path].decode()}
+            except UnicodeDecodeError as exc:
+                raise GatewayError("Bridge files/read requires UTF-8") from exc
         if endpoint == "files/write":
             files[path] = payload["content"].encode()
             return {"written": payload["path"]}
@@ -310,6 +321,197 @@ def update_scan_metadata(files, path, suffix):
     files[path] = encode(manifest)
 
 
+@pytest.mark.parametrize(("difference", "classification", "fields"), [
+    ("scope", "substantive_difference", ["scope"]),
+    ("private_attribute", "substantive_difference", []),
+    ("invalid", "invalid_manifest", None),
+    ("invalid_files", "invalid_manifest", None),
+    ("invalid_metadata", "invalid_manifest", None),
+    ("missing", "missing_manifest", None),
+])
+def test_dry_run_reports_manifest_conflicts_without_exposing_values(
+    gateway, mock_bridge, mock_client, difference, classification, fields,
+):
+    files, tools = gateway
+    path = f"{VIEW_DIR}/resource.json"
+    update_scan_metadata(files, path, "04")
+    exported = files[path]
+    edited = json.loads(exported)
+    live = encode(edited)
+    if difference == "scope":
+        live = encode({**edited, "scope": "C"})
+    elif difference == "private_attribute":
+        edited["attributes"]["private-key"] = "private-value"
+        live = encode(edited)
+    elif difference == "invalid":
+        live = b"invalid-manifest-content"
+    elif difference == "invalid_files":
+        live = encode({**edited, "files": "view.json"})
+    elif difference == "invalid_metadata":
+        edited["attributes"]["lastModification"]["timestamp"] = 42
+        live = encode(edited)
+    elif difference == "missing":
+        live = None
+    original = mock_bridge.call.side_effect
+
+    def bridge(endpoint, payload):
+        if endpoint == "files/read" and payload["path"] == f"{PROJECT}/{path}":
+            if live is None:
+                raise NotFoundError("missing")
+            return {"content": live.decode()}
+        return original(endpoint, payload)
+
+    mock_bridge.call.side_effect = bridge
+    preview = tools["perspective_deploy"](PROJECT, **changes())
+    assert preview["error"] == "deployment_conflict"
+    assert preview["message"] == f"Unexpected live content at {path}"
+    assert preview["manifest_comparison"] == {
+        "path": path, "classification": classification,
+        "export_sha256": deployment._sha(exported),
+        "bridge_sha256": deployment._sha(live) if live is not None else None,
+        **({"differing_known_fields": fields} if fields is not None else {}),
+    }
+    for private in ("private-key", "private-value", "invalid-manifest-content"):
+        assert private not in json.dumps(preview)
+    result = apply(tools, expected_state=preview["base_state"], **changes())
+    assert result["error"] == "deployment_conflict"
+    assert "manifest_comparison" not in result
+    assert not mutations(mock_bridge)
+    mock_client.scan_projects.assert_not_called()
+
+
+@pytest.mark.parametrize("filename", [None, "view.json", "thumbnail.png"])
+def test_initial_bridge_comparison_tolerates_only_manifest_metadata(
+    gateway, mock_bridge, mock_client, filename,
+):
+    files, tools = gateway
+    manifest = f"{VIEW_DIR}/resource.json"
+    update_scan_metadata(files, manifest, "04")
+    bridge_files = {manifest: files[manifest]}
+    update_scan_metadata(bridge_files, manifest, "05")
+    if filename is not None:
+        drifted = f"{VIEW_DIR}/{filename}"
+        bridge_files[drifted] = CHANGED_PNG if filename == "thumbnail.png" else files[drifted] + b" "
+    original = mock_bridge.call.side_effect
+
+    def bridge(endpoint, payload):
+        path = payload["path"].removeprefix(PROJECT + "/")
+        if endpoint == "files/read" and path in bridge_files:
+            if path.endswith("/thumbnail.png"):
+                assert payload.get("format") == "sha256"
+                return {"sha256": sha256(bridge_files[path]).hexdigest()}
+            return {"content": bridge_files[path].decode()}
+        return original(endpoint, payload)
+
+    mock_bridge.call.side_effect = bridge
+    edit = {"views": [deployment.ViewChange(view_path="Area/Existing", view_json=VIEW)]}
+    preview = tools["perspective_deploy"](PROJECT, **edit)
+    assert not mutations(mock_bridge)
+    result = apply(tools, expected_state=preview["base_state"], **edit)
+    if filename is None:
+        assert preview["status"] == "dry_run", preview
+        assert result["status"] == "success", result
+        assert result["verified"] == [f"{VIEW_DIR}/view.json"]
+        assert files[f"{VIEW_DIR}/thumbnail.png"] == PNG
+        assert [call.args[1]["path"] for call in mutations(mock_bridge)] == [
+            f"{PROJECT}/{VIEW_DIR}/view.json",
+        ]
+    else:
+        for report in (preview, result):
+            assert report["error"] == "deployment_conflict", report
+            assert report["message"] == f"Unexpected live content at {drifted}"
+        assert not mutations(mock_bridge)
+        mock_client.scan_projects.assert_not_called()
+
+
+@pytest.mark.parametrize("filename", ["resource.json", "view.json", "thumbnail.png"])
+def test_bridge_change_after_initial_preflight_blocks_first_write(
+    gateway, mock_bridge, mock_client, filename,
+):
+    files, tools = gateway
+    path = f"{VIEW_DIR}/{filename}"
+    if filename == "resource.json":
+        update_scan_metadata(files, path, "04")
+        live = {path: files[path]}
+        update_scan_metadata(live, path, "05")
+        initial = live[path]
+        update_scan_metadata(live, path, "06")
+        changed = live[path]
+    else:
+        initial = files[path]
+        changed = CHANGED_PNG if filename == "thumbnail.png" else initial + b" "
+    original = mock_bridge.call.side_effect
+    reads = 0
+
+    def bridge(endpoint, payload):
+        nonlocal reads
+        if endpoint == "files/read" and payload["path"] == f"{PROJECT}/{path}":
+            reads += 1
+            data = initial if reads == 1 else changed
+            if filename == "thumbnail.png":
+                assert payload.get("format") == "sha256"
+                return {"sha256": sha256(data).hexdigest()}
+            return {"content": data.decode()}
+        return original(endpoint, payload)
+
+    mock_bridge.call.side_effect = bridge
+    result = apply(tools, views=[deployment.ViewChange(view_path="Area/Existing", view_json=VIEW)])
+    assert result["error"] == "deployment_conflict", result
+    assert result["message"] == f"Unexpected live content at {path}"
+    assert reads == 2
+    assert not mutations(mock_bridge)
+    mock_client.scan_projects.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["missing_manifest", "invalid_manifest"])
+def test_incomplete_resource_blocks_deployment(gateway, mock_bridge, mock_client, failure):
+    files, tools = gateway
+    path = f"{VIEW_DIR}/resource.json"
+    if failure == "missing_manifest":
+        del files[path]
+    else:
+        files[path] = b"{}"
+    edit = {"views": [deployment.ViewChange(view_path="Area/Existing", view_json=VIEW)]}
+    for report in (tools["perspective_deploy"](PROJECT, **edit), apply(tools, **edit)):
+        assert report["status"] == "error", report
+        assert path in report["message"] or VIEW_DIR in report["message"]
+        assert not report["attempted"]
+    assert not mutations(mock_bridge)
+    mock_client.scan_projects.assert_not_called()
+
+
+@pytest.mark.parametrize(("failure", "code"), [
+    ("missing", "deployment_conflict"),
+    ("legacy_text", "gateway_error"),
+    ("malformed_digest", "gateway_error"),
+    ("unreadable", "gateway_error"),
+])
+def test_unverified_binary_file_blocks_deployment(gateway, mock_bridge, mock_client, failure, code):
+    _, tools = gateway
+    path = f"{VIEW_DIR}/thumbnail.png"
+    original = mock_bridge.call.side_effect
+
+    def bridge(endpoint, payload):
+        if endpoint == "files/read" and payload["path"] == f"{PROJECT}/{path}":
+            assert payload.get("format") == "sha256"
+            if failure == "missing":
+                raise NotFoundError("missing")
+            if failure == "unreadable":
+                raise GatewayError("read failed")
+            if failure == "legacy_text":
+                return {"content": "unexpected text response"}
+            return {"sha256": "z" * 64}
+        return original(endpoint, payload)
+
+    mock_bridge.call.side_effect = bridge
+    edit = {"views": [deployment.ViewChange(view_path="Area/Existing", view_json=VIEW)]}
+    for report in (tools["perspective_deploy"](PROJECT, **edit), apply(tools, **edit)):
+        assert report["error"] == code, report
+        assert path in report["message"]
+    assert not mutations(mock_bridge)
+    mock_client.scan_projects.assert_not_called()
+
+
 def test_scan_metadata_changes_allow_deployment_and_scoped_restore(
     gateway, mock_client, mock_bridge
 ):
@@ -446,7 +648,7 @@ def test_side_nav_export_bridge_manifest_comparison(
     update_scan_metadata(files, page_manifest, "04")
     update_scan_metadata(files, deployment._SESSION_MANIFEST, "04")
     original = mock_bridge.call.side_effect
-    accepted_preview = difference in {"metadata", "stale", "concurrent"}
+    accepted_preview = difference in {"metadata", "session_manifest", "stale", "concurrent"}
     wrote = False
 
     def bridge(endpoint, payload):
@@ -489,7 +691,7 @@ def test_side_nav_export_bridge_manifest_comparison(
         files["project.json"] = b'{"title":"Edited"}'
     result = apply(tools, expected_state=preview["base_state"], **side_nav)
 
-    if difference == "metadata":
+    if difference in {"metadata", "session_manifest"}:
         assert result["status"] == "success", result
         assert result["verified"] == preview["planned"]
         assert page_manifest not in result["attempted"]
@@ -500,9 +702,7 @@ def test_side_nav_export_bridge_manifest_comparison(
     if difference == "stale":
         assert "expected_state" in result["message"]
     else:
-        path = {"config": CONFIG, "session_manifest": deployment._SESSION_MANIFEST}.get(
-            difference, page_manifest,
-        )
+        path = CONFIG if difference == "config" else page_manifest
         assert result["message"] == f"Unexpected live content at {path}"
 
 

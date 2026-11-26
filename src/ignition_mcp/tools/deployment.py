@@ -61,6 +61,12 @@ class Conflict(GatewayError):
     code = "deployment_conflict"
 
 
+class _ManifestConflict(Conflict):
+    def __init__(self, path: str, exported: bytes | None, live: bytes | None) -> None:
+        super().__init__(f"Unexpected live content at {path}")
+        self.comparison = _manifest_comparison(path, exported, live)
+
+
 def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -107,6 +113,49 @@ def _without_scan_metadata(content: bytes, path: str, *, drop_actor: bool = Fals
     return json.dumps(manifest, sort_keys=True)
 
 
+def _manifest_comparison(path: str, exported: bytes | None, live: bytes | None) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "path": path,
+        "export_sha256": _sha(exported) if exported is not None else None,
+        "bridge_sha256": _sha(live) if live is not None else None,
+    }
+    if exported is None or live is None:
+        return {**report, "classification": "missing_manifest"}
+
+    try:
+        left, right = (_object(data, path) for data in (exported, live))
+        _declared_files(left, path)
+        _declared_files(right, path)
+    except GatewayError:
+        return {**report, "classification": "invalid_manifest"}
+
+    def fields(manifest: dict[str, Any]) -> dict[str, str]:
+        known = {key: manifest[key] for key in ("scope", "version", "restricted", "overridable", "files")
+                 if key in manifest}
+        attributes = manifest.get("attributes")
+        if isinstance(attributes, dict):
+            if "lastModificationSignature" in attributes:
+                known["attributes.lastModificationSignature"] = attributes["lastModificationSignature"]
+            modification = attributes.get("lastModification")
+            if isinstance(modification, dict):
+                for key in ("actor", "timestamp"):
+                    if key in modification:
+                        known[f"attributes.lastModification.{key}"] = modification[key]
+        return {key: json.dumps(value, sort_keys=True) for key, value in known.items()}
+
+    if json.dumps(left, sort_keys=True) == json.dumps(right, sort_keys=True):
+        classification = "formatting_only"
+    elif _without_scan_metadata(exported, path) == _without_scan_metadata(live, path):
+        classification = "scan_metadata_only"
+    else:
+        classification = "substantive_difference"
+    left_fields, right_fields = fields(left), fields(right)
+    return {**report, "classification": classification, "differing_known_fields": [
+        key for key in sorted(left_fields.keys() | right_fields.keys())
+        if left_fields.get(key) != right_fields.get(key)
+    ]}
+
+
 def _matches_after_scan(
     path: str, expected: bytes | None, actual: bytes | None, *, session_edit: bool = False,
 ) -> bool:
@@ -121,11 +170,15 @@ def _matches_after_scan(
         return _without_scan_metadata(expected, path, drop_actor=external) == (
             _without_scan_metadata(actual, path, drop_actor=external)
         )
-    if path in {_PAGE_MANIFEST, _SESSION_MANIFEST} or re.fullmatch(
-        rf"{re.escape(PERSPECTIVE)}/views/.+/resource\.json", path
-    ):
+    if _is_perspective_manifest(path):
         return _without_scan_metadata(expected, path) == _without_scan_metadata(actual, path)
     return False
+
+
+def _is_perspective_manifest(path: str) -> bool:
+    return path in {_PAGE_MANIFEST, _SESSION_MANIFEST} or re.fullmatch(
+        rf"{re.escape(PERSPECTIVE)}/views/.+/resource\.json", path
+    ) is not None
 
 
 def _relative(path: str) -> bool:
@@ -133,6 +186,31 @@ def _relative(path: str) -> bool:
         not any(c in path for c in ("\\", ":", "\x00"))
         and all(part not in ("", ".", "..") for part in path.split("/"))
     )
+
+
+def _declared_files(manifest: dict[str, Any], path: str) -> list[str]:
+    names = manifest.get("files")
+    if not isinstance(names, list) or any(
+        not isinstance(name, str) or not _relative(name) for name in names
+    ):
+        raise GatewayError(f"Invalid resource manifest files list in {path}")
+    if _is_perspective_manifest(path):
+        attributes = manifest.get("attributes", {})
+        modification = attributes.get("lastModification", {}) if isinstance(attributes, dict) else None
+        if (
+            "resource.json" in names
+            or len(names) != len(set(names))
+            or manifest.get("scope", "G") not in ("A", "C", "G")
+            or type(manifest.get("version", 1)) is not int
+            or not isinstance(manifest.get("restricted", False), bool)
+            or not isinstance(manifest.get("overridable", True), bool)
+            or not isinstance(modification, dict)
+            or not isinstance(attributes.get("lastModificationSignature", ""), str)
+            or not isinstance(modification.get("timestamp", ""), str)
+            or not isinstance(modification.get("actor", ""), str)
+        ):
+            raise GatewayError(f"Invalid Perspective resource manifest in {path}")
+    return names
 
 
 def _check_write_scope(changes: PATCH) -> None:
@@ -172,12 +250,9 @@ def _archive(data: bytes) -> FILES:
     for path, content in files.items():
         if not path.endswith("/resource.json"):
             continue
-        declared = _object(content, path).get("files")
-        if not isinstance(declared, list):
-            raise GatewayError(f"Resource manifest is missing its files list: {path}")
         parent = path.rsplit("/", 1)[0]
-        for name in declared:
-            if not isinstance(name, str) or not _relative(name) or f"{parent}/{name}" not in files:
+        for name in _declared_files(_object(content, path), path):
+            if f"{parent}/{name}" not in files:
                 raise GatewayError(f"Project ZIP is missing a file declared in {path}")
     return files
 
@@ -310,30 +385,72 @@ def _stage_resource(
         changes[manifest] = _encode(_resource_manifest(name))
 
 
+def _requires_binary_read(content: bytes | None) -> bool:
+    if content is None:
+        return False
+    try:
+        content.decode("utf-8")
+    except UnicodeDecodeError:
+        return True
+    return False
+
+
 def _check_paths(
     ctx: AppContext, project: str, expected: PATCH, *, after_scan: bool = False,
-    session_edit: bool = False, export_page_manifest: bool = False,
+    session_edit: bool = False, export_manifests: frozenset[str] = frozenset(),
+    diagnose_manifests: bool = False,
 ) -> PATCH:
     observed: PATCH = {}
     for path, content in expected.items():
+        target = f"{project}/{path}"
         try:
-            actual = _read_project_file(ctx, f"{project}/{path}").encode()
+            if content is not None and _requires_binary_read(content):
+                result = ctx.bridge.call("files/read", {"path": target, "format": "sha256"})
+                digest = result.get("sha256") if isinstance(result, dict) else None
+                if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                    raise GatewayError("Bridge did not return a valid raw SHA-256")
+                # Only retain the reference bytes when the digest of the live file matches.
+                actual = content if digest == _sha(content) else None
+            else:
+                actual = _read_project_file(ctx, target).encode("utf-8")
         except NotFoundError:
             actual = None
-        compare_manifest = export_page_manifest and path == _PAGE_MANIFEST
-        matches = (
-            _matches_after_scan(path, content, actual, session_edit=session_edit)
-            if after_scan or compare_manifest else actual == content
-        )
+        except (GatewayError, UnicodeError) as exc:
+            raise GatewayError(f"Could not verify live bytes at {path}: {exc}") from exc
+        matches = actual == content
+        if after_scan:
+            matches = _matches_after_scan(path, content, actual, session_edit=session_edit)
+        elif (
+            not matches and path in export_manifests
+            and content is not None and actual is not None
+        ):
+            try:
+                _declared_files(_object(actual, path), path)
+                matches = _without_scan_metadata(content, path) == _without_scan_metadata(actual, path)
+            except GatewayError:
+                matches = False
         if not matches:
+            if diagnose_manifests and path in export_manifests:
+                raise _ManifestConflict(path, content, actual)
             raise Conflict(f"Unexpected live content at {path}")
         observed[path] = actual
     return observed
 
 
-def _live_preconditions(before: FILES, changes: PATCH) -> PATCH:
-    paths = changes.keys() | {p.rsplit("/", 1)[0] + "/resource.json" for p in changes}
-    return {path: before.get(path) for path in sorted(paths)}
+def _check_export_paths(
+    ctx: AppContext, project: str, before: FILES, changes: PATCH, *,
+    diagnose_manifests: bool = False,
+) -> PATCH:
+    manifests = frozenset(f"{path.rsplit('/', 1)[0]}/resource.json" for path in changes)
+    paths = changes.keys() | manifests
+    for path in manifests:
+        if path in before:
+            folder = path.rsplit("/", 1)[0]
+            paths.update(f"{folder}/{name}" for name in _declared_files(_object(before[path], path), path))
+    return _check_paths(
+        ctx, project, {path: before.get(path) for path in sorted(paths)},
+        export_manifests=manifests, diagnose_manifests=diagnose_manifests,
+    )
 
 
 def _write_private(path: Path, content: bytes) -> None:
@@ -367,7 +484,6 @@ def _apply_patch(before: FILES, changes: PATCH) -> FILES:
 
 def _verify(
     ctx: AppContext, project: str, expected: FILES, changes: PATCH, *, session_edit: bool = False,
-    export_page_manifest: bool = False,
 ) -> FILES:
     _check_paths(ctx, project, changes, after_scan=True, session_edit=session_edit)
     for attempt in range(_VERIFY_ATTEMPTS):
@@ -377,10 +493,7 @@ def _verify(
             for path, content in expected.items()
         ):
             _check_inventory(ctx, project, actual)
-            _check_paths(
-                ctx, project, {path: actual.get(path) for path in changes},
-                export_page_manifest=export_page_manifest,
-            )
+            _check_paths(ctx, project, {path: actual.get(path) for path in changes})
             return actual
         if attempt + 1 < _VERIFY_ATTEMPTS:
             time.sleep(_VERIFY_DELAY)
@@ -389,7 +502,7 @@ def _verify(
 
 def _execute(
     ctx: AppContext, root: Path, project: str, data: bytes, before: FILES, changes: PATCH,
-    report: dict[str, Any], *, export_page_manifest: bool = False,
+    report: dict[str, Any],
 ) -> None:
     report["phase"] = "backup"
     backup = _save_backup(root, project, data)
@@ -400,15 +513,11 @@ def _execute(
         raise Conflict("Project changed since the backup export")
     _check_inventory(ctx, project, before)
 
-    # Include unchanged manifests of edited resources in the live preconditions.
-    live = _live_preconditions(before, changes)
+    # Capture the original Bridge bytes for strict checks before every write.
+    live = _check_export_paths(ctx, project, before, changes)
     for path, content in changes.items():
         report["phase"] = "preflight"
-        # Pin the Bridge bytes before the first write. Subsequent preconditions
-        # compare Bridge reads byte-for-byte, including manifest metadata.
-        live = _check_paths(
-            ctx, project, live, export_page_manifest=export_page_manifest and not report["attempted"],
-        )
+        _check_paths(ctx, project, live)
         report["phase"] = "write"
         report["attempted"].append(path)
         target = f"{project}/{path}"
@@ -431,8 +540,7 @@ def _execute(
     ctx.client.scan_projects()
     report["phase"] = "verification"
     actual = _verify(
-        ctx, project, expected, live, session_edit=_SESSION_PATH in changes,
-        export_page_manifest=export_page_manifest,
+        ctx, project, expected, changes, session_edit=_SESSION_PATH in changes,
     )
     report["verified"] = list(changes)
     report["phase"] = "receipt"
@@ -481,25 +589,17 @@ def register(mcp: FastMCP, ctx: AppContext, backup_root: Path | None = None) -> 
                 report["planned"] = list(changes)
                 if not dry_run and ctx.settings.restricted_deployment:
                     _check_write_scope(changes)
-                export_page_manifest = (
-                    not backup_id and f"{PAGE_CONFIG}/config.json" in changes
-                    and _PAGE_MANIFEST in before and _PAGE_MANIFEST not in changes
-                )
                 if dry_run or not changes:
-                    _check_paths(
-                        ctx, project, _live_preconditions(before, changes),
-                        export_page_manifest=export_page_manifest,
-                    )
+                    _check_export_paths(ctx, project, before, changes, diagnose_manifests=dry_run)
                     return {**report, "status": "dry_run" if dry_run else "no_changes"}
-                _execute(
-                    ctx, root, project, data, before, changes, report,
-                    export_page_manifest=export_page_manifest,
-                )
+                _execute(ctx, root, project, data, before, changes, report)
         except (IgnitionMcpError, httpx.HTTPError, OSError, UnicodeError) as exc:
             uncertain = bool(report["attempted"])
             report.update(status="uncertain" if uncertain else "error", message=str(exc))
             if isinstance(exc, IgnitionMcpError):
                 report["error"] = exc.code
+            if isinstance(exc, _ManifestConflict):
+                report["manifest_comparison"] = exc.comparison
         return report
 
     @mcp.tool()
@@ -518,6 +618,8 @@ def register(mcp: FastMCP, ctx: AppContext, backup_root: Path | None = None) -> 
         Set expected_state to the base_state from dry_run to pin the reviewed project version.
         exclusive_access attests that other project editors have been coordinated.
         configure_side_nav adds the shared West Dock and scadaSelection to the same plan.
+        The initial ZIP-to-Bridge check compares each declared file byte-for-byte and
+        tolerates scan metadata changes in manifests. Dry-run reports manifest conflicts.
         """
         return run(
             project, dry_run, confirm, exclusive_access, views or [], pages or [], expected_state,
